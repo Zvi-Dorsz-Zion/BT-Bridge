@@ -11,6 +11,7 @@ public partial class App : Application
     private EventWaitHandle? _showSignal;
     private Forms.NotifyIcon? _tray;
     private MainWindow? _main;
+    private ClipboardWatcher? _clipboard;
 
     public static Bridge Core { get; private set; } = null!;
     public bool Exiting { get; private set; }
@@ -47,7 +48,13 @@ public partial class App : Application
             var dlg = new SetPasswordWindow(firstRun: true);
             if (dlg.ShowDialog() != true) { Shutdown(); return; }
         }
+        if (Identity.WasReset)
+            MessageBox.Show("המפתח של המחשב לא נטען, ולכן נוצר מפתח חדש.\nהמכשירים המוכרים יבקשו את הסיסמה פעם אחת.",
+                "גשר בלוטוס", MessageBoxButton.OK, MessageBoxImage.Warning, MessageBoxResult.OK,
+                MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign);
         Core.Start();
+        try { _clipboard = new ClipboardWatcher(Core); }
+        catch (Exception ex) { Log.Write("clipboard watcher: " + ex.Message); }
 
         _tray = new Forms.NotifyIcon
         {
@@ -60,6 +67,10 @@ public partial class App : Application
         _tray.ContextMenuStrip.Items.Add("יציאה", null, (_, _) => ExitApp());
         _tray.DoubleClick += (_, _) => ShowMain();
         Core.Notice += msg => Dispatcher.BeginInvoke(() => Balloon(msg));
+        // The phone's notifications, next to the clock.
+        Core.PhoneNotification += (s, app, title, text) => Dispatcher.BeginInvoke(() =>
+            Balloon(string.IsNullOrWhiteSpace(text) ? title : (string.IsNullOrWhiteSpace(title) ? text : title + "\n" + text),
+                $"{Core.DisplayName(s)} · {app}"));
         _tray.BalloonTipClicked += (_, _) => ShowMain();
 
         // Started with Windows: stay next to the clock.
@@ -67,11 +78,11 @@ public partial class App : Application
         else ShowMain();
     }
 
-    public void Balloon(string msg)
+    public void Balloon(string msg, string title = "גשר בלוטוס")
     {
-        if (_tray == null) return;
-        _tray.BalloonTipTitle = "גשר בלוטוס";
-        _tray.BalloonTipText = msg;
+        if (_tray == null || msg.Length == 0) return;
+        _tray.BalloonTipTitle = title.Length > 60 ? title[..60] : title;
+        _tray.BalloonTipText = msg.Length > 250 ? msg[..250] + "…" : msg;
         _tray.ShowBalloonTip(3000);
     }
 

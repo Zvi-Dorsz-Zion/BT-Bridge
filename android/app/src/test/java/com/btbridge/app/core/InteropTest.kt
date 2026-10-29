@@ -40,6 +40,7 @@ class InteropTest {
             trusted += TrustedDevice(fp, Crypto.b64(pub), name, address, os)
         }
         override fun touch(fp: String, name: String, address: String) {}
+        fun forgetAll() = trusted.clear()
     }
 
     /**
@@ -103,18 +104,22 @@ class InteropTest {
         val inbox: File = Files.createTempDirectory("btb-inbox").toFile()
         val received = CopyOnWriteArrayList<File>()
         val inputs = CopyOnWriteArrayList<String>()
-        val files = FileService({ store.deviceName }, "android", File("."), { emptyList() }, { inbox }, { _, f -> received += f })
+        val clips = CopyOnWriteArrayList<String>()
+        val files = FileService({ store.deviceName }, "android", File("."), { emptyList() }, { inbox }, { _, f, _ -> received += f })
         val wifi = WifiLinks({ sessions.filter { !it.closed } }, ::ips, WifiLinks::plainConnect).also { it.start() }
 
         fun add(hr: HandshakeResult, initiator: Boolean, sock: Socket): Session {
             val s = Session(hr, "AABBCCDDEE09", initiator, this)
             sessions += s
+            // Like the app: a dropped Wi-Fi link comes back by itself.
+            s.onWifiLost = { x -> Thread { Thread.sleep(500); wifi.refresh(x) }.start() }
             s.attach(Link(false, sock.getInputStream(), sock.getOutputStream(), sock, hr.codec))
             wifi.announce(s)
             return s
         }
 
         override fun handle(s: Session, id: Int, req: JSONObject): JSONObject? {
+            if (req.str("op") == "log") return JSONObject().put("ok", true).put("text", "יומן בדיקה")
             if (req.str("op") != "screen-open") return files.handle(s, id, req)
             val src = ScreenSource(s, id, FakePhoneScreen(), { ev, x, y, x2, y2 -> inputs += "${ev.str("t")} $x $y $x2 $y2" }, JvmCodec, req)
             s.reply(id, JSONObject().put("ok", true).put("kind", "android").put("monitors", org.json.JSONArray()))
@@ -123,6 +128,7 @@ class InteropTest {
         }
 
         override fun onEvent(s: Session, ev: JSONObject) {
+            if (ev.str("ev") == "clip") { clips += ev.str("text") ?: ""; return }
             if (!ScreenSource.onEvent(s, ev)) wifi.onEvent(s, ev)
         }
 
@@ -134,7 +140,27 @@ class InteropTest {
 
     private fun pattern(n: Int) = ByteArray(n) { ((it * 31 + 7) and 0xff).toByte() }
 
-    @Test
+    init {
+        // The Windows side checks that our version and features arrive.
+        AppInfo.version = "9.9.9"
+    }
+
+    /** Sends the same Wi-Fi hello twice on raw connections: the first must be answered, the second refused (PROTOCOL.md section 6). */
+    private fun replayRefused(s: Session): Boolean {
+        val linkId = Crypto.random(16)
+        val hello = Crypto.concat(linkId, Crypto.hmac(s.linkKey, Crypto.utf8("btb-wifi"), linkId))
+        fun attempt(): ByteArray? = Socket(s.peerIps.first(), s.peerPort).use { c ->
+            c.soTimeout = 3000
+            Wire.write(c.getOutputStream(), hello)
+            runCatching { Wire.read(c.getInputStream()) }.getOrNull()
+        }
+        val first = attempt()
+        val second = attempt()
+        println("REPLAY first=${first?.size} second=${second?.size}")
+        return first?.size == 48 && second == null
+    }
+
+    @Test(timeout = 300_000)
     fun kotlinServer_windowsClient() {
         assumeTrue("INTEROP_EXE not set", exe != null)
         val node = Node()
@@ -171,6 +197,9 @@ class InteropTest {
         assertTrue(File(dir, "שם-חדש").isDirectory)
         assertTrue(!File(dir, "למחיקה").exists())
         assertTrue(dir.listFiles()!!.none { it.name.endsWith(".btpart") })
+        assertTrue("replay test", out.contains("REPLAY refused"))
+        assertTrue("resumed download", out.contains("RESUME-DOWNLOAD ok"))
+        assertTrue("clip from windows: ${node.clips}", node.clips.contains("מהמחשב"))
 
         // "Send to device" from Windows landed in the phone's inbox, and "../" was refused.
         val got = File(File(node.inbox, "תת"), "מחשב.bin")
@@ -192,7 +221,7 @@ class InteropTest {
     private fun assertEquals(expected: Int, actual: Int, tolerance: Int) =
         assertTrue("expected $expected±$tolerance, got $actual", kotlin.math.abs(expected - actual) <= tolerance)
 
-    @Test
+    @Test(timeout = 300_000)
     fun windowsServer_kotlinClient() {
         assumeTrue("INTEROP_EXE not set", exe != null)
         val node = Node()
@@ -204,6 +233,7 @@ class InteropTest {
         try {
             val reader = p.inputStream.bufferedReader(Charsets.UTF_8)
             val port = reader.readLine().removePrefix("PORT ").trim().toInt()
+            val win = p.outputStream.bufferedWriter(Charsets.UTF_8)
             Thread { reader.forEachLine { println("[win] $it"); winOut += it } }.apply { isDaemon = true }.start()
 
             var asked = 0
@@ -222,6 +252,13 @@ class InteropTest {
             assertEquals("windows", s.peerOs)
             repeat(50) { if (!s.hasWifi) Thread.sleep(100) }
             assertTrue("wifi link", s.hasWifi)
+            assertTrue("caps ${s.peerCaps}", s.has("resume") && s.has("clip") && s.peerApp.isNotEmpty())
+            assertTrue("windows saw our version: $winOut", winOut.any { it.contains("app=9.9.9 clip=True") })
+
+            // A recorded Wi-Fi hello must not be accepted twice; the real link comes back afterwards.
+            assertTrue("replay refused", replayRefused(s))
+            repeat(80) { if (!s.hasWifi) Thread.sleep(100) }
+            assertTrue("wifi back after replay test", s.hasWifi)
 
             val listing = RemoteFs.list(s, dir.path)
             assertTrue(listing.items.any { it.name == "from-windows.bin" && it.size == 3_000_000L })
@@ -232,6 +269,13 @@ class InteropTest {
             RemoteFs.download(s, RemoteFs.join(s, dir.path, "from-windows.bin"), got, Transfer("got", false))
             assertTrue(got.readBytes().contentEquals(pattern(3_000_000)))
 
+            // Resume a download: part of it is here from an interrupted try.
+            val item = listing.items.first { it.name == "from-windows.bin" }
+            val resumed = File(state, "resumed.bin")
+            File(resumed.path + ".btpart").writeBytes(pattern(3_000_000).copyOfRange(0, 1_100_000))
+            RemoteFs.download(s, item.path, resumed, Transfer("resumed", false).apply { attempts = 1 }, item.size, item.mtime)
+            assertTrue("resumed download", resumed.readBytes().contentEquals(pattern(3_000_000)))
+
             val upSrc = pattern(2_500_000)
             val t = Transfer("up", true)
             val landed = RemoteFs.upload(s, { upSrc.inputStream() }, upSrc.size.toLong(), System.currentTimeMillis(),
@@ -241,6 +285,20 @@ class InteropTest {
             val landed2 = RemoteFs.upload(s, { upSrc.inputStream() }, upSrc.size.toLong(), 0,
                 RemoteFs.join(s, dir.path, "from-kotlin.bin"), Transfer("up2", true))
             assertTrue(landed2.endsWith("from-kotlin (1).bin"))
+
+            // Resume an upload: the other side keeps the part that arrived before the interruption.
+            val full = pattern(2_000_000)
+            File(dir, "resume-up.bin.btpart").writeBytes(full.copyOfRange(0, 700_000))
+            val tu = Transfer("resume-up", true).apply { attempts = 1 }
+            val landed3 = RemoteFs.upload(s, { full.inputStream() }, full.size.toLong(), 0, RemoteFs.join(s, dir.path, "resume-up.bin"), tu)
+            assertTrue("resumed upload", File(landed3).readBytes().contentEquals(full))
+
+            // Shared clipboard, both ways, and the other side's log.
+            s.sendEvent(JSONObject().put("ev", "clip").put("text", "מהטלפון"))
+            win.write("CLIP hello-from-windows\n"); win.flush()
+            repeat(50) { if (node.clips.isEmpty()) Thread.sleep(100) }
+            assertTrue("clip from windows: ${node.clips}", node.clips.contains("hello-from-windows"))
+            assertTrue("log", s.request(JSONObject().put("op", "log")).has("text"))
 
             // Cancel in the middle of a download: the stream stops and nothing is left behind.
             val big = File(dir, "big.bin").apply { writeBytes(ByteArray(100_000_000)) }
@@ -295,12 +353,23 @@ class InteropTest {
             val s2 = connect { _, _ -> throw AssertionError("password asked on a trusted connection") }
             assertTrue(RemoteFs.list(s2, dir.path).items.any { it.name == "from-kotlin.bin" })
             s2.close()
+            Thread.sleep(300)
+
+            // Only the computer forgot us: the password is asked once, then both trust each other again.
+            win.write("FORGET\n"); win.flush()
+            repeat(50) { if (winOut.none { it == "FORGOT" }) Thread.sleep(100) }
+            var asked3 = 0
+            connect { _, _ -> asked3++; PasswordAnswer(password, true) }.close()
+            assertEquals(1, asked3)
+            Thread.sleep(300)
+            connect { _, _ -> throw AssertionError("password asked after trust was restored") }.close()
 
             // What the Windows side reported.
             assertTrue("input click: $winOut", winOut.any { it.startsWith("INPUT click 640 360") })
             assertTrue("input text", winOut.any { it.startsWith("INPUT text") && it.contains("שלום") })
             assertTrue("input key", winOut.any { it.startsWith("INPUT key") && it.contains("Enter") })
             assertTrue("received", winOut.any { it.startsWith("RECEIVED") && it.contains("צילום.jpg") })
+            assertTrue("clip reached windows", winOut.any { it == "CLIP מהטלפון" })
         } finally {
             runCatching { p.outputStream.close() }
             p.waitFor(5, TimeUnit.SECONDS)

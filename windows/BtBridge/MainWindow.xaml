@@ -7,6 +7,7 @@
         Background="#F5F7FA" WindowStartupLocation="CenterScreen" AllowDrop="True"
         PreviewKeyDown="Window_PreviewKeyDown">
     <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="Vis" />
         <DataTemplate DataType="{x:Type local:DeviceHeader}">
             <DockPanel Margin="0,10,0,2">
                 <Button DockPanel.Dock="Left" Content="{Binding Action}" Visibility="{Binding ActionVisibility}"
@@ -65,6 +66,8 @@
                             <MenuItem x:Name="MenuDisconnect" Header="נתק" Click="Disconnect_Click" />
                             <MenuItem Header="שנה כינוי…" Click="Rename_Device_Click" />
                             <MenuItem x:Name="MenuForget" Header="שכח מכשיר (בפעם הבאה תידרש סיסמה)" Click="Forget_Click" />
+                            <Separator />
+                            <MenuItem x:Name="MenuLog" Header="הצג את היומן של המכשיר (לבירור תקלות)" Click="DeviceLog_Click" />
                         </ContextMenu>
                     </ListBox.ContextMenu>
                 </ListBox>
@@ -75,14 +78,23 @@
         <DockPanel Grid.Column="1" Margin="14,14,14,6">
             <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8">
                 <StackPanel x:Name="SessionActions" DockPanel.Dock="Left" Orientation="Horizontal">
-                    <Button Content="📱 מסך הטלפון" Click="PhoneScreen_Click" ToolTip="צפייה ושליטה במסך הטלפון" />
-                    <Button Content="📤 שלח לטלפון…" Click="SendTo_Click" ToolTip="שולח קבצים לתיקיית ההורדות של הטלפון" />
+                    <Button x:Name="PhoneScreenBtn" Content="📱 מסך הטלפון" Click="PhoneScreen_Click" ToolTip="צפייה ושליטה במסך הטלפון" />
+                    <Button Content="📤 שלח למכשיר…" Click="SendTo_Click" ToolTip="שולח קבצים לתיקיית ההורדות של המכשיר" />
+                    <Button x:Name="RingBtn" Content="🔔 צלצל לטלפון" Click="Ring_Click" ToolTip="הטלפון יצלצל 30 שניות, גם כשהוא על שקט" />
                 </StackPanel>
                 <StackPanel>
                     <TextBlock x:Name="HeaderText" FontSize="18" FontWeight="SemiBold" />
                     <TextBlock x:Name="HeaderSub" Foreground="{StaticResource Muted}" FontSize="12" />
                 </StackPanel>
             </DockPanel>
+            <Border x:Name="VersionNotice" DockPanel.Dock="Top" Visibility="Collapsed" Background="#FEF3C7" BorderBrush="#F59E0B"
+                    BorderThickness="1" CornerRadius="4" Padding="10,6" Margin="3,0,3,8">
+                <DockPanel>
+                    <Button x:Name="SendUpdateBtn" DockPanel.Dock="Left" Content="שלח עדכון לטלפון" Click="SendUpdate_Click"
+                            Style="{StaticResource Primary}" Margin="8,0,0,0" />
+                    <TextBlock x:Name="VersionText" TextWrapping="Wrap" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
             <WrapPanel x:Name="Toolbar" DockPanel.Dock="Top">
                 <Button Content="→ חזור" Click="Back_Click" ToolTip="חזרה לתיקייה הקודמת" />
                 <Button Content="⬆ למעלה" Click="Up_Click" ToolTip="לתיקייה שמעל" />
@@ -147,9 +159,10 @@
                     <TextBlock Text="העברות" FontWeight="SemiBold" VerticalAlignment="Center" />
                 </DockPanel>
                 <ListBox x:Name="TransferList" BorderThickness="0" HorizontalContentAlignment="Stretch"
-                         MouseDoubleClick="TransferList_MouseDoubleClick">
+                         MouseDoubleClick="TransferList_MouseDoubleClick" ContextMenuOpening="TransferList_ContextMenuOpening">
                     <ListBox.ContextMenu>
                         <ContextMenu>
+                            <MenuItem x:Name="MenuResume" Header="המשך מאיפה שנעצר" Click="TransferResume_Click" />
                             <MenuItem Header="פתח" Click="TransferOpen_Click" />
                             <MenuItem Header="הצג בתיקייה" Click="TransferShow_Click" />
                             <MenuItem Header="העתק נתיב" Click="TransferCopy_Click" />
@@ -176,7 +189,9 @@
                                 <TextBlock Grid.Column="5" Text="{Binding LinkKind}" FontSize="12" Foreground="{StaticResource Muted}" />
                                 <TextBlock Grid.Column="6" Text="{Binding Status}" FontSize="12" TextTrimming="CharacterEllipsis" ToolTip="{Binding Status}" />
                                 <Button Grid.Column="7" Content="✕" Padding="4,0" Margin="0" Click="CancelTransfer_Click" ToolTip="בטל"
-                                        IsEnabled="{Binding Active}" />
+                                        Visibility="{Binding Active, Converter={StaticResource Vis}}" />
+                                <Button Grid.Column="7" Content="↻" Padding="4,0" Margin="0" Click="TransferResume_Click" ToolTip="המשך מאיפה שנעצר"
+                                        Visibility="{Binding CanResume, Converter={StaticResource Vis}}" />
                             </Grid>
                         </DataTemplate>
                     </ListBox.ItemTemplate>

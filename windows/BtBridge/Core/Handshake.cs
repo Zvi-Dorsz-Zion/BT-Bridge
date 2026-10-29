@@ -10,7 +10,8 @@ public sealed record PasswordAnswer(string Password, bool Remember);
 public delegate PasswordAnswer? AskPassword(string peerName, bool wrongBefore);
 
 public sealed record HandshakeResult(
-    RecordCodec Codec, byte[] LinkKey, string PeerName, string PeerOs, string PeerFp, byte[] PeerPub);
+    RecordCodec Codec, byte[] LinkKey, string PeerName, string PeerOs, string PeerFp, byte[] PeerPub,
+    string PeerApp, IReadOnlySet<string> PeerCaps);
 
 public sealed class AuthException(string code, string message) : Exception(message)
 {
@@ -41,15 +42,18 @@ public sealed class Lockout
 /// <summary>PROTOCOL.md section 2.</summary>
 public static class Handshake
 {
-    public const int Version = 1;
+    public const int Version = 2;
+
+    /// <summary>Optional features this side understands (PROTOCOL.md section 2, "caps").</summary>
+    public static readonly string[] Caps = { "clip", "notif", "resume", "ring", "battery", "update", "log" };
+
+    /// <summary>PBKDF2 rounds a peer may ask for: fewer would make a captured proof easy to crack, more would freeze us.</summary>
+    public const int MinIter = 10_000, MaxIter = 5_000_000;
 
     public static HandshakeResult Client(Stream s, Identity me, AppSettings st, string peerAddress, AskPassword ask)
     {
-        var known = st.FindByAddress(peerAddress);
         using var eph = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
-        var hello = Hello(me, st, eph);
-        hello["needPw"] = known == null;
-        var c = Utf8(hello.ToJsonString());
+        var c = Utf8(Hello(me, st, eph).ToJsonString());
         Wire.Write(s, c);
 
         var sBytes = Wire.Read(s);
@@ -58,23 +62,34 @@ public static class Handshake
         var fp = Fingerprint(peerPub);
         var peerName = sh["name"]?.GetValue<string>() ?? "?";
         var peerOs = sh["os"]?.GetValue<string>() ?? "";
-        if (known != null && known.Fp != fp)
+
+        // Trust is by key. The Bluetooth address only catches a reinstalled device, to explain the password prompt.
+        var known = st.FindByFp(fp);
+        var byAddress = st.FindByAddress(peerAddress);
+        if (known == null && byAddress != null)
             throw new AuthException("keychanged",
-                $"המפתח של \"{known.Name}\" השתנה מאז הפעם הקודמת. אם התקנת אותו מחדש, לחץ \"שכח מכשיר\" ונסה שוב.");
+                $"המפתח של \"{byAddress.Name}\" השתנה מאז הפעם הקודמת. אם התקנת אותו מחדש, לחץ \"שכח מכשיר\" ונסה שוב.");
 
         var (codec, linkKey, th) = Derive(eph, B64(sh["eph"]), c, sBytes, client: true);
-        var pwInfo = sh["pw"] as JsonObject;
-        if (pwInfo?["set"]?.GetValue<bool>() == false)
+        var pwInfo = sh["pw"] as JsonObject ?? throw new ProtocolException("הודעת פתיחה לא תקינה");
+        bool trustsMe = sh["trusted"]?.GetValue<bool>() == true;
+        bool needPw = !(trustsMe && known != null);
+        Log.Write($"handshake with {peerName} ({peerAddress}): they trust us={trustsMe}, we trust them={known != null}");
+        if (needPw && pwInfo["set"]?.GetValue<bool>() == false)
             throw new AuthException("nopassword", $"ב-\"{peerName}\" עוד לא נקבעה סיסמה. קבע סיסמה שם ונסה שוב.");
+        int iter = pwInfo["iter"]?.GetValue<int>() ?? 0;
+        if (needPw && iter is < MinIter or > MaxIter)
+            throw new ProtocolException("הגדרות הסיסמה במכשיר השני לא תקינות");
+
         bool wrong = false;
         for (int attempt = 0; attempt < 3; attempt++)
         {
             byte[]? key = null;
             bool remember = false;
-            if (pwInfo != null)
+            if (needPw)
             {
                 var a = ask(peerName, wrong) ?? throw new OperationCanceledException("בוטל");
-                key = Pbkdf2(a.Password, B64(pwInfo["salt"]), pwInfo["iter"]!.GetValue<int>());
+                key = Pbkdf2(a.Password, B64(pwInfo["salt"]), iter);
                 remember = a.Remember;
             }
             var auth = new JsonObject
@@ -99,15 +114,11 @@ public static class Handshake
                         throw new AuthException("sig", "המכשיר השני לא הוכיח שהוא יודע את הסיסמה");
                     if (remember) st.Trust(fp, peerPub, peerName, peerAddress, peerOs);
                 }
-                else if (known == null)
-                {
-                    throw new AuthException("sig", "המכשיר השני לא ביקש סיסמה, אבל הוא לא מוכר כאן");
-                }
                 else st.Touch(fp, peerName, peerAddress);
-                return new HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub);
+                return Result(codec, linkKey, peerName, peerOs, fp, peerPub, sh);
             }
             var err = res["err"]?.GetValue<string>() ?? "";
-            if (err == "password" && pwInfo != null) { wrong = true; continue; }
+            if (err == "password" && needPw) { wrong = true; continue; }
             throw new AuthException(err, err switch
             {
                 "password" => "סיסמה שגויה",
@@ -127,16 +138,18 @@ public static class Handshake
         var fp = Fingerprint(peerPub);
         var peerName = ch["name"]?.GetValue<string>() ?? "?";
         var peerOs = ch["os"]?.GetValue<string>() ?? "";
-        bool trusted = st.FindByFp(fp) != null && ch["needPw"]?.GetValue<bool>() != true;
+        bool trusted = st.FindByFp(fp) != null;
 
         using var eph = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var hello = Hello(me, st, eph);
-        hello["pw"] = trusted ? null : new JsonObject
+        // The password details always go out: the client may not trust us even when we trust it.
+        hello["pw"] = new JsonObject
         {
             ["salt"] = st.HasPassword ? st.PwSalt : B64(Random(16)),
             ["iter"] = st.PwIter,
             ["set"] = st.HasPassword,
         };
+        hello["trusted"] = trusted;
         var sBytes = Utf8(hello.ToJsonString());
         Wire.Write(s, sBytes);
 
@@ -150,23 +163,27 @@ public static class Handshake
             if (!Verify(peerPub, Concat(Utf8("btb-c"), th), B64(auth["sig"])))
                 Fail(s, codec, "sig");
 
-            if (trusted)
+            var proof = auth["pw"] is JsonNode n ? Convert.FromBase64String(n.GetValue<string>()) : null;
+            if (proof == null)
             {
+                if (!trusted) Fail(s, codec, "password");
                 st.Touch(fp, peerName, peerAddress);
                 Ok(s, codec, me, th, null);
-                return new HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub);
+                Log.Write($"handshake with {peerName} ({peerAddress}): trusted both ways");
+                return Result(codec, linkKey, peerName, peerOs, fp, peerPub, ch);
             }
             if (!st.HasPassword) Fail(s, codec, "nopassword");
             if (lockout.Locked) Fail(s, codec, "locked");
 
             var key = st.PasswordKey();
-            var proof = auth["pw"] is JsonNode n ? Convert.FromBase64String(n.GetValue<string>()) : null;
             if (Same(proof, Hmac(key, Utf8("btb-pw-c"), th)))
             {
                 lockout.Reset();
-                if (auth["remember"]?.GetValue<bool>() == true) st.Trust(fp, peerPub, peerName, peerAddress, peerOs);
+                bool remember = auth["remember"]?.GetValue<bool>() == true;
+                if (remember) st.Trust(fp, peerPub, peerName, peerAddress, peerOs);
                 Ok(s, codec, me, th, Hmac(key, Utf8("btb-pw-s"), th));
-                return new HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub);
+                Log.Write($"handshake with {peerName} ({peerAddress}): password ok, remember={remember}, we trusted them before={trusted}");
+                return Result(codec, linkKey, peerName, peerOs, fp, peerPub, ch);
             }
             lockout.Fail();
             Log.Write($"wrong password from {peerName} ({peerAddress})");
@@ -177,21 +194,36 @@ public static class Handshake
 
     // ---------------------------------------------------------------- helpers
 
-    private static JsonObject Hello(Identity me, AppSettings st, ECDiffieHellman eph) => new()
+    private static JsonObject Hello(Identity me, AppSettings st, ECDiffieHellman eph)
     {
-        ["v"] = Version,
-        ["name"] = st.DeviceName,
-        ["os"] = "windows",
-        ["id"] = B64(me.Public),
-        ["eph"] = B64(PublicBytes(eph.ExportParameters(false))),
-        ["nonce"] = B64(Random(32)),
-    };
+        var caps = new JsonArray();
+        foreach (var cap in Caps) caps.Add(cap);
+        return new JsonObject
+        {
+            ["v"] = Version,
+            ["name"] = st.DeviceName,
+            ["os"] = "windows",
+            ["app"] = AppInfo.Version,
+            ["caps"] = caps,
+            ["id"] = B64(me.Public),
+            ["eph"] = B64(PublicBytes(eph.ExportParameters(false))),
+            ["nonce"] = B64(Random(32)),
+        };
+    }
+
+    private static HandshakeResult Result(RecordCodec codec, byte[] linkKey, string name, string os, string fp, byte[] pub, JsonObject hello)
+    {
+        var caps = new HashSet<string>();
+        if (hello["caps"] is JsonArray arr)
+            foreach (var n in arr) if (n?.GetValue<string>() is { } cap) caps.Add(cap);
+        return new HandshakeResult(codec, linkKey, name, os, fp, pub, hello["app"]?.GetValue<string>() ?? "", caps);
+    }
 
     private static JsonObject ParseHello(byte[] b)
     {
         var o = JsonNode.Parse(b) as JsonObject ?? throw new ProtocolException("הודעת פתיחה לא תקינה");
         if (o["v"]?.GetValue<int>() != Version)
-            throw new ProtocolException("גרסת הפרוטוקול במכשיר השני שונה. עדכן את שני הצדדים.");
+            throw new ProtocolException("גרסת הפרוטוקול במכשיר השני שונה. עדכן את שני הצדדים לאותה גרסה של גשר בלוטוס.");
         return o;
     }
 
@@ -221,5 +253,19 @@ public static class Handshake
         try { Wire.Write(s, codec.Seal(Rec.Json(Rec.AuthResult, 0, new JsonObject { ["ok"] = false, ["err"] = err }))); }
         catch { }
         throw new AuthException(err, "האימות נכשל: " + err);
+    }
+}
+
+/// <summary>This program's version, sent to the other side (it offers updates and shows mismatches).</summary>
+public static class AppInfo
+{
+    public static string Version { get; } =
+        typeof(AppInfo).Assembly.GetName().Version is { } v ? $"{v.Major}.{v.Minor}.{v.Build}" : "0";
+
+    /// <summary>-1, 0 or 1, comparing "1.2.3" strings; anything unreadable counts as oldest.</summary>
+    public static int Compare(string a, string b)
+    {
+        static System.Version P(string s) => System.Version.TryParse(s, out var v) ? v : new System.Version(0, 0);
+        return P(a).CompareTo(P(b));
     }
 }

@@ -229,6 +229,10 @@ public sealed class Bridge : IRequestHandler
     /// </summary>
     public async Task EnsureFastLinkAsync(Session s)
     {
+        if (s.HasWifi) return;
+        // On a shared network the Wi-Fi link may just have dropped: try it again first, it is faster than a hotspot.
+        Wifi.Refresh(s);
+        for (int i = 0; i < 12 && !s.HasWifi && !s.Closed; i++) await Task.Delay(250);
         if (s.HasWifi || Settings.DirectMode == "off" || s.PeerOs != "android") return;
         if (!DirectNetwork.HasWifiAdapter()) return;
         try
@@ -283,6 +287,16 @@ public sealed class Bridge : IRequestHandler
             SessionsChanged?.Invoke();
         };
         s.Changed += _ => SessionsChanged?.Invoke();
+        // A dropped Wi-Fi link comes back by itself within seconds, not only on the 30-second announcement.
+        s.WifiLost += _ => Task.Run(async () =>
+        {
+            foreach (var wait in new[] { 2000, 8000 })
+            {
+                await Task.Delay(wait);
+                if (s.Closed || s.HasWifi) return;
+                Wifi.Refresh(s);
+            }
+        });
         s.Attach(link);
         Wifi.Announce(s);
         SessionsChanged?.Invoke();
@@ -311,10 +325,29 @@ public sealed class Bridge : IRequestHandler
             }
             case "direct":
                 throw new RemoteException("unsupported", "רשת ישירה נפתחת רק בטלפון");
+            case "ring":
+                throw new RemoteException("unsupported", "צלצול קיים רק בטלפון");
+            case "log":
+                return Task.FromResult<JsonObject?>(new JsonObject { ["ok"] = true, ["text"] = Log.Tail(64 * 1024) });
             default:
                 return Files.HandleAsync(s, id, req);
         }
     }
+
+    /// <summary>Text the other device copied (PROTOCOL.md section 5, "clip"). Raised on a worker thread.</summary>
+    public event Action<Session, string>? ClipboardReceived;
+    /// <summary>A notification that appeared on the phone: app, title, text.</summary>
+    public event Action<Session, string, string, string>? PhoneNotification;
+
+    /// <summary>Sends copied text to every connected device that shares the clipboard.</summary>
+    public void ShareClipboard(string text)
+    {
+        if (!Settings.ShareClipboard || text.Length == 0 || text.Length > MaxClip) return;
+        foreach (var s in Sessions.Where(x => x.Has("clip")))
+            try { s.SendEvent(new JsonObject { ["ev"] = "clip", ["text"] = text }); } catch { }
+    }
+
+    public const int MaxClip = 200_000;
 
     public void OnEvent(Session s, JsonObject ev)
     {
@@ -328,6 +361,20 @@ public sealed class Bridge : IRequestHandler
                 break;
             case "direct-end":
                 Direct.Leave();
+                break;
+            case "clip":
+                if (Settings.ShareClipboard && ev["text"]?.GetValue<string>() is { Length: > 0 and <= MaxClip } text)
+                    ClipboardReceived?.Invoke(s, text);
+                break;
+            case "notif":
+                if (Settings.ShowPhoneNotifications)
+                    PhoneNotification?.Invoke(s, ev["app"]?.GetValue<string>() ?? "", ev["title"]?.GetValue<string>() ?? "",
+                        ev["text"]?.GetValue<string>() ?? "");
+                break;
+            case "battery":
+                s.Battery = ev["level"]?.GetValue<int>() ?? -1;
+                s.Charging = ev["charging"]?.GetValue<bool>() == true;
+                SessionsChanged?.Invoke();
                 break;
             default:
                 Wifi.OnEvent(s, ev);
@@ -377,6 +424,16 @@ public sealed class WifiLinks(Bridge bridge)
     {
         Announce(s);
         if (!s.HasWifi) _ = TryConnect(s, notifyFail: true);
+    }
+
+    /// <summary>
+    /// Brings a dropped Wi-Fi link back. Only the side that opened Bluetooth connects, so the two sides never race
+    /// each other into two links; the other side just announces itself, which makes the opener try.
+    /// </summary>
+    public void Refresh(Session s)
+    {
+        Announce(s);
+        if (s.Initiator && !s.HasWifi) _ = TryConnect(s, notifyFail: true);
     }
 
     public void OnEvent(Session s, JsonObject ev)
@@ -454,6 +511,16 @@ public sealed class WifiLinks(Bridge bridge)
         }
     }
 
+    /// <summary>
+    /// PROTOCOL.md section 6. Both sides add fresh randomness to the link keys, and the accepting side refuses a link id
+    /// it has seen, so a recorded hello can neither take over the link nor make us reuse an AES-GCM nonce.
+    /// </summary>
+    public static (byte[] Up, byte[] Down) LinkKeys(byte[] linkKey, byte[] linkId, byte[] srvNonce)
+    {
+        var tag = Convert.ToHexString(linkId).ToLowerInvariant() + Convert.ToHexString(srvNonce).ToLowerInvariant();
+        return (Expand(linkKey, "up " + tag), Expand(linkKey, "down " + tag));
+    }
+
     private static async Task<bool> LinkHandshake(Session s, TcpClient c)
     {
         try
@@ -462,15 +529,19 @@ public sealed class WifiLinks(Bridge bridge)
             var st = c.GetStream();
             var linkId = Random(16);
             st.ReadTimeout = 5000;
-            await Task.Run(() =>
+            var srvNonce = await Task.Run(() =>
             {
                 Wire.Write(st, Concat(linkId, Hmac(s.LinkKey, Utf8("btb-wifi"), linkId)));
-                if (!Same(Wire.Read(st), Hmac(s.LinkKey, Utf8("btb-wifi-ok"), linkId)))
+                var r = Wire.Read(st);
+                if (r.Length != 48) throw new ProtocolException("wifi ack");
+                var nonce = r[..16];
+                if (!Same(r[16..], Hmac(s.LinkKey, Utf8("btb-wifi-ok"), linkId, nonce)))
                     throw new ProtocolException("wifi ack");
+                return nonce;
             });
             st.ReadTimeout = Timeout.Infinite;
-            var hex = Convert.ToHexString(linkId).ToLowerInvariant();
-            s.Attach(new Link(true, st, c, new RecordCodec(Expand(s.LinkKey, "up " + hex), Expand(s.LinkKey, "down " + hex))));
+            var (up, down) = LinkKeys(s.LinkKey, linkId, srvNonce);
+            s.Attach(new Link(true, st, c, new RecordCodec(up, down)));
             return true;
         }
         catch (Exception ex)
@@ -504,10 +575,13 @@ public sealed class WifiLinks(Bridge bridge)
             var mac = f[16..];
             var s = bridge.Sessions.FirstOrDefault(x => Same(mac, Hmac(x.LinkKey, Utf8("btb-wifi"), linkId)))
                 ?? throw new ProtocolException("unknown wifi link");
-            Wire.Write(st, Hmac(s.LinkKey, Utf8("btb-wifi-ok"), linkId));
+            lock (s.UsedLinkIds)
+                if (!s.UsedLinkIds.Add(Convert.ToHexString(linkId))) throw new ProtocolException("wifi link id replayed");
+            var srvNonce = Random(16);
+            Wire.Write(st, Concat(srvNonce, Hmac(s.LinkKey, Utf8("btb-wifi-ok"), linkId, srvNonce)));
             st.ReadTimeout = Timeout.Infinite;
-            var hex = Convert.ToHexString(linkId).ToLowerInvariant();
-            s.Attach(new Link(true, st, c, new RecordCodec(Expand(s.LinkKey, "down " + hex), Expand(s.LinkKey, "up " + hex))));
+            var (up, down) = LinkKeys(s.LinkKey, linkId, srvNonce);
+            s.Attach(new Link(true, st, c, new RecordCodec(down, up)));
         }
         catch (Exception ex)
         {

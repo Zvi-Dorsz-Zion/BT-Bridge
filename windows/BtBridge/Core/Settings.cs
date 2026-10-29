@@ -25,6 +25,23 @@ public static class Log
         }
         catch { }
     }
+
+    /// <summary>The end of the log, for the other device's "show log" (PROTOCOL.md section 4, "log").</summary>
+    public static string Tail(int maxBytes)
+    {
+        try
+        {
+            lock (Gate)
+            {
+                var f = Path.Combine(Dir, "log.txt");
+                if (!File.Exists(f)) return "";
+                using var fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                fs.Seek(Math.Max(0, fs.Length - maxBytes), SeekOrigin.Begin);
+                return new StreamReader(fs, System.Text.Encoding.UTF8).ReadToEnd();
+            }
+        }
+        catch (Exception ex) { return "היומן לא נקרא: " + ex.Message; }
+    }
 }
 
 /// <summary>Turns any error into a Hebrew message for the user; the original goes to the log.</summary>
@@ -78,6 +95,10 @@ public sealed class AppSettings
     public bool AllowControl { get; set; } = true;
     /// <summary>"auto": join the phone's temporary hotspot when there is no shared network. "off": never.</summary>
     public string DirectMode { get; set; } = "auto";
+    /// <summary>Text copied on one device can be pasted on the other.</summary>
+    public bool ShareClipboard { get; set; } = true;
+    /// <summary>Notifications that appear on the phone show up next to the clock here too.</summary>
+    public bool ShowPhoneNotifications { get; set; } = true;
     /// <summary>Local nicknames by fingerprint (or by Bluetooth address for devices never connected).</summary>
     public Dictionary<string, string> Nicknames { get; set; } = new();
 
@@ -210,6 +231,9 @@ public sealed class Identity
         Fp = Crypto.Fingerprint(Public);
     }
 
+    /// <summary>The saved key could not be read and a new one was made: known devices will ask for the password again.</summary>
+    public static bool WasReset { get; private set; }
+
     public byte[] Sign(byte[] data) =>
         _key.SignData(data, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
 
@@ -227,7 +251,10 @@ public sealed class Identity
             }
             catch (Exception ex)
             {
+                // Keep the unreadable file (it may be readable again under the right Windows user) and tell the user once.
                 Log.Write("identity load failed, creating new: " + ex.Message);
+                try { File.Copy(f, f + $".bad-{DateTime.Now:yyyyMMdd-HHmmss}", true); } catch { }
+                WasReset = true;
                 key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
             }
         }

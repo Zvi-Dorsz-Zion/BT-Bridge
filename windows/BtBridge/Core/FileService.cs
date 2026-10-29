@@ -3,17 +3,84 @@ using System.Text.Json.Nodes;
 
 namespace BtBridge.Core;
 
-/// <summary>Writes an incoming DATA…END stream into a file.</summary>
-public sealed class FileSink(FileStream fs, Action<int>? progress, Action<JsonObject> onEnd, Action<string> onFail) : IStreamSink
+/// <summary>
+/// Writes an incoming DATA…END stream into a file on its own thread, so a slow disk never holds up the link
+/// (pings, requests and other streams keep flowing). Up to 64 chunks wait in memory; beyond that the link waits.
+/// onEnd and onFail run on the writer thread after everything before them was written and the file was closed.
+/// </summary>
+public sealed class FileSink : IStreamSink
 {
-    public void OnData(ReadOnlySpan<byte> data)
+    private readonly FileStream _fs;
+    private readonly Action<int>? _progress;
+    private readonly Action<JsonObject> _onEnd;
+    private readonly Action<string> _onFail;
+    private readonly System.Collections.Concurrent.BlockingCollection<object> _q = new(64);
+    private volatile Exception? _error;
+
+    private sealed record EndMark(JsonObject End);
+    private sealed record FailMark(string Why);
+
+    public FileSink(FileStream fs, Action<int>? progress, Action<JsonObject> onEnd, Action<string> onFail)
     {
-        fs.Write(data);
-        progress?.Invoke(data.Length);
+        _fs = fs;
+        _progress = progress;
+        _onEnd = onEnd;
+        _onFail = onFail;
+        new Thread(Run) { IsBackground = true, Name = "file-writer" }.Start();
     }
 
-    public void OnEnd(JsonObject end) => onEnd(end);
-    public void OnFail(string why) => onFail(why);
+    public void OnData(ReadOnlySpan<byte> data)
+    {
+        if (_error is { } e) throw e;
+        Put(data.ToArray());
+    }
+
+    public void OnEnd(JsonObject end) => Put(new EndMark(end));
+    public void OnFail(string why) => Put(new FailMark(why));
+
+    /// <summary>After the end or a failure nothing more is accepted (a late record is dropped instead of waiting forever).</summary>
+    private void Put(object item)
+    {
+        try { _q.Add(item); } catch (InvalidOperationException) { }
+    }
+
+    private void Run()
+    {
+        foreach (var item in _q.GetConsumingEnumerable())
+        {
+            switch (item)
+            {
+                case byte[] b:
+                    if (_error != null) continue;
+                    try { _fs.Write(b); _progress?.Invoke(b.Length); }
+                    catch (Exception ex) { _error = ex; }
+                    break;
+                case EndMark m:
+                    _q.CompleteAdding();
+                    Finish();
+                    try
+                    {
+                        if (_error != null) _onFail(Heb.Of(_error));
+                        else _onEnd(m.End);
+                    }
+                    catch (Exception ex) { Log.Write("file sink end: " + ex.Message); }
+                    return;
+                case FailMark f:
+                    _q.CompleteAdding();
+                    Finish();
+                    try { _onFail(f.Why); } catch (Exception ex) { Log.Write("file sink fail: " + ex.Message); }
+                    return;
+            }
+        }
+    }
+
+    private void Finish()
+    {
+        try { _fs.Dispose(); } catch (Exception ex) { _error ??= ex; }
+    }
+
+    /// <summary>A failure the user asked for (cancel). Anything else (a dropped connection) keeps the partial file for resuming.</summary>
+    public static bool IsCancel(string why) => why.StartsWith("בוטל");
 }
 
 /// <summary>Serves this computer's files to the other device (PROTOCOL.md section 4).</summary>
@@ -174,14 +241,18 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
         if (Directory.Exists(path)) throw new RemoteException("exists", "קיימת תיקייה בשם הזה: " + path);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var part = path + ".btpart";
-        var fs = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16);
+        // Resume (PROTOCOL.md section 4): the target name is chosen the same way again, so an interrupted
+        // upload finds its own partial file and only the rest is sent.
+        long have = 0;
+        bool resume = req["resume"]?.GetValue<bool>() == true && File.Exists(part);
+        var fs = new FileStream(part, resume ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+        if (resume) have = fs.Length;
         var mtime = req["mtime"]?.GetValue<long>() ?? 0;
         s.ExpectStream(id, new FileSink(fs, null,
             _ =>
             {
                 try
                 {
-                    fs.Dispose();
                     File.Move(part, path, overwrite);
                     if (mtime > 0) File.SetLastWriteTimeUtc(path, DateTimeOffset.FromUnixTimeMilliseconds(mtime).UtcDateTime);
                     s.SendDone(id, new JsonObject { ["ok"] = true, ["path"] = path });
@@ -195,11 +266,10 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
             },
             why =>
             {
-                fs.Dispose();
-                TryDelete(part);
+                if (FileSink.IsCancel(why)) TryDelete(part);
                 try { s.SendDone(id, new JsonObject { ["err"] = "cancelled", ["msg"] = why }); } catch { }
             }));
-        return new JsonObject { ["ok"] = true, ["path"] = path };
+        return new JsonObject { ["ok"] = true, ["path"] = path, ["have"] = have };
     }
 
     public static string UniquePath(string path)

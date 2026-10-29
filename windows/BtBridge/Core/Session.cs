@@ -28,13 +28,26 @@ public sealed class Session
     public bool Initiator { get; }
     public byte[] LinkKey { get; }
     public bool Closed { get; private set; }
+    /// <summary>The other side's program version ("0.3.0").</summary>
+    public string PeerApp { get; }
+    public IReadOnlySet<string> PeerCaps { get; }
+    public bool Has(string cap) => PeerCaps.Contains(cap);
 
     /// <summary>Wi-Fi addresses the other side announced (PROTOCOL.md section 5).</summary>
     public string[] PeerIps { get; set; } = Array.Empty<string>();
     public int PeerPort { get; set; }
 
+    /// <summary>The phone's battery (PROTOCOL.md section 5, "battery"), or -1 before it reported.</summary>
+    public int Battery { get; set; } = -1;
+    public bool Charging { get; set; }
+
+    /// <summary>Wi-Fi link ids already accepted on this session: a recorded hello can't be replayed (PROTOCOL.md section 6).</summary>
+    public HashSet<string> UsedLinkIds { get; } = new();
+
     public event Action<Session>? Changed;
     public event Action<Session>? OnClosed;
+    /// <summary>The Wi-Fi link dropped while Bluetooth is still up.</summary>
+    public event Action<Session>? WifiLost;
 
     private readonly IRequestHandler _handler;
     private readonly object _gate = new();
@@ -70,6 +83,8 @@ public sealed class Session
         PeerAddress = peerAddress;
         Initiator = initiator;
         LinkKey = hr.LinkKey;
+        PeerApp = hr.PeerApp;
+        PeerCaps = hr.PeerCaps;
         _handler = handler;
         _nextId = initiator ? -1 : 0;
         _watchdog = new Timer(_ => Watchdog(), null, 15_000, 15_000);
@@ -106,18 +121,22 @@ public sealed class Session
 
     private void LinkClosed(Link link)
     {
-        bool dead;
+        bool dead, wifiLost = false;
         lock (_gate)
         {
             if (_bt == link) _bt = null;
-            if (_wifi == link) _wifi = null;
+            if (_wifi == link) { _wifi = null; wifiLost = true; }
             dead = _bt == null && _wifi == null;
         }
         foreach (var (id, e) in _sinks)
             if (dead || (e.Sticky && e.Link == link))
                 if (_sinks.TryRemove(id, out var gone)) gone.Sink.OnFail("החיבור נותק");
         if (dead) Close();
-        else Changed?.Invoke(this);
+        else
+        {
+            Changed?.Invoke(this);
+            if (wifiLost) WifiLost?.Invoke(this);
+        }
     }
 
     public void Close()

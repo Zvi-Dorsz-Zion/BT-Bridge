@@ -34,6 +34,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- "Ring the phone" from the computer, and keeping Wi-Fi awake while a transfer or the screen runs -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Installing an APK that arrived from the computer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
@@ -106,6 +109,30 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility" />
         </service>
+
+        <!-- "Send clipboard to computer" from the notification: reads the clipboard while it has focus, then closes -->
+        <activity
+            android:name=".ClipSendActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- The phone's notifications on the computer (the user allows "notification access" once) -->
+        <service
+            android:name=".BridgeNotifications"
+            android:exported="true"
+            android:label="גשר בלוטוס - התראות במחשב"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".RingStopReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"

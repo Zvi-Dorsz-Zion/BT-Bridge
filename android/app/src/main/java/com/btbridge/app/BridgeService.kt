@@ -62,7 +62,8 @@ class BridgeService : Service() {
         }
         scope.launch {
             var n = 1000
-            b.received.collect { (file, from) ->
+            b.received.collect { r ->
+                val file = r.file
                 val open = runCatching {
                     val uri = FileProvider.getUriForFile(this@BridgeService, "$packageName.files", file)
                     val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
@@ -70,7 +71,8 @@ class BridgeService : Service() {
                         Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
                         PendingIntent.FLAG_IMMUTABLE)
                 }.getOrNull() ?: openApp()
-                runCatching { nm.notify(n++, event("התקבל ${file.name} מ-$from", open)) }
+                val msg = if (r.update) "התקבל עדכון לגשר בלוטוס מ-${r.from}. הקש כדי להתקין." else "התקבל ${file.name} מ-${r.from}"
+                runCatching { nm.notify(n++, event(msg, open)) }
             }
         }
     }
@@ -97,14 +99,18 @@ class BridgeService : Service() {
             .setAutoCancel(true)
             .build()
 
-    private fun build(text: String): Notification =
-        Notification.Builder(this, App.CHANNEL_SERVICE)
+    private fun build(text: String): Notification {
+        val clip = PendingIntent.getActivity(this, 5,
+            Intent(this, ClipSendActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, App.CHANNEL_SERVICE)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("גשר בלוטוס")
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(openApp())
+            .apply { if (App.bridge.store.shareClipboard) addAction(Notification.Action.Builder(null, "שלח את הלוח למחשב", clip).build()) }
             .build()
+    }
 }
 
 /** Starts the background service after the phone boots, so the computer can connect without opening the app. */

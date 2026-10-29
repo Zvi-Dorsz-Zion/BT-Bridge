@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>BtBridge</RootNamespace>
     <AssemblyName>BtBridge</AssemblyName>
-    <Version>0.2.4</Version>
+    <Version>0.3.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
@@ -20,6 +20,11 @@
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
     <Using Include="System.IO" />
+  </ItemGroup>
+
+  <!-- The phone app of the same version, so the computer can update the phone without internet (בנייה.cmd builds it first). -->
+  <ItemGroup Condition="Exists('..\..\BtBridge.apk')">
+    <EmbeddedResource Include="..\..\BtBridge.apk" LogicalName="phone.apk" />
   </ItemGroup>
 
   <ItemGroup>

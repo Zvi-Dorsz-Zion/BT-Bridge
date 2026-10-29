@@ -28,6 +28,20 @@ class App : Application() {
                 logFile.appendText("${fmt.format(Date())} $msg\n")
             }
         }
+        Log.tail = { max ->
+            synchronized(logFile) {
+                runCatching {
+                    java.io.RandomAccessFile(logFile, "r").use { f ->
+                        val start = maxOf(0L, f.length() - max)
+                        f.seek(start)
+                        val b = ByteArray((f.length() - start).toInt())
+                        f.readFully(b)
+                        String(b, Charsets.UTF_8)
+                    }
+                }.getOrElse { "היומן לא נקרא: ${it.message}" }
+            }
+        }
+        com.btbridge.app.core.AppInfo.version = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "0"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CHANNEL_SERVICE, "פועל ברקע", NotificationManager.IMPORTANCE_LOW))
         nm.createNotificationChannel(NotificationChannel(CHANNEL_EVENTS, "חיבורים", NotificationManager.IMPORTANCE_DEFAULT))

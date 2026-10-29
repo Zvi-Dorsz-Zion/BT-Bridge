@@ -7,11 +7,20 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.StatFs
 import android.os.storage.StorageManager
 import com.btbridge.app.core.AskPassword
@@ -53,6 +62,9 @@ class Bridge(private val ctx: Context) : RequestHandler {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("7f3c2a10-5b8e-4d21-9c47-2e6b1a9d0f53")
         fun key(address: String) = address.filter { it.isLetterOrDigit() }.uppercase()
+
+        /** Errors that mean "the connection went away", not "this file can't be transferred". */
+        private val linkErrors = listOf("החיבור נותק", "החיבור נסגר", "ההעברה נתקעה", "אין תשובה מהמכשיר השני")
     }
 
     val store = AndroidStore(ctx)
@@ -74,6 +86,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
 
     private val bg = Executors.newCachedThreadPool { r -> Thread(r, "bridge-bg").apply { isDaemon = true } }
     private val transferExec = Executors.newSingleThreadExecutor { r -> Thread(r, "transfers").apply { isDaemon = true } }
+    private val main = Handler(Looper.getMainLooper())
     private var started = false
 
     @Synchronized
@@ -92,6 +105,8 @@ class Bridge(private val ctx: Context) : RequestHandler {
         }, 300, 300, TimeUnit.MILLISECONDS)
         timer.scheduleAtFixedRate({ runCatching { closeIdleHotspot() } }, 15, 15, TimeUnit.SECONDS)
         timer.scheduleAtFixedRate({ runCatching { cleanViewFiles() } }, 10, 15 * 60, TimeUnit.SECONDS)
+        timer.scheduleAtFixedRate({ runCatching { holdWifiWhileBusy() } }, 2, 2, TimeUnit.SECONDS)
+        watchBattery()
     }
 
     /** Deletes files that were opened only for viewing, after the time chosen in the settings. */
@@ -106,13 +121,18 @@ class Bridge(private val ctx: Context) : RequestHandler {
 
     fun displayName(s: Session) = store.nameFor(s.peerFp, s.peerName)
 
-    // ------------------------------------------------------------------ direct network
+    fun sessionFor(fp: String): Session? = sessions.value.firstOrNull { it.peerFp == fp && !it.closed }
+
+    // ------------------------------------------------------------------ fast link
 
     /**
-     * Before a big transfer or screen sharing with a computer: when there is no Wi-Fi link, opens the direct
-     * network (PROTOCOL.md section 8) and waits a little for the link. Blocking; never throws.
+     * Before a big transfer or screen sharing: when there is no Wi-Fi link, first tries the shared network again
+     * (the link may just have dropped), and only then opens the direct network (PROTOCOL.md section 8). Blocking; never throws.
      */
     fun ensureFastLink(s: Session) {
+        if (s.hasWifi) return
+        wifi.refresh(s)
+        repeat(12) { if (!s.hasWifi && !s.closed) Thread.sleep(250) }
         if (s.hasWifi || store.directMode == "off" || s.peerOs != "windows") return
         try {
             openDirect(s)
@@ -142,22 +162,97 @@ class Bridge(private val ctx: Context) : RequestHandler {
         for (s in sessions.value) if (s.peerOs == "windows") runCatching { s.sendEvent(JSONObject().put("ev", "direct-end")) }
     }
 
+    /**
+     * Phones put Wi-Fi to sleep between packets, which slows screen sharing and transfers and can drop the link.
+     * While something is moving, keep Wi-Fi fully awake; otherwise let it rest.
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    @Suppress("DEPRECATION")
+    private fun holdWifiWhileBusy() {
+        val busy = sessions.value.any { it.hasWifi && it.hasActiveStreams } || transfers.value.any { it.active }
+        val lock = wifiLock ?: ctx.applicationContext.getSystemService(WifiManager::class.java)
+            ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "btbridge")?.apply { setReferenceCounted(false) }
+            ?.also { wifiLock = it } ?: return
+        if (busy && !lock.isHeld) lock.acquire() else if (!busy && lock.isHeld) lock.release()
+    }
+
     // ------------------------------------------------------------------ received files
 
-    private fun onReceived(s: Session, f: File) {
+    private fun onReceived(s: Session, f: File, update: Boolean) {
         val t = Transfer(f.name, upload = false).apply {
             total = f.length()
             done.set(f.length())
-            status = "התקבל מ-${displayName(s)}"
+            status = if (update) "עדכון לגשר בלוטוס מ-${displayName(s)}. הקש \"פתח\" כדי להתקין." else "התקבל מ-${displayName(s)}"
             resultPath = f.path
             active = false
         }
         transfers.value = listOf(t) + transfers.value
-        received.tryEmit(f to displayName(s))
+        received.tryEmit(Received(f, displayName(s), update))
     }
 
+    class Received(val file: File, val from: String, val update: Boolean)
+
     /** Files that arrived through "send to device" (the service shows a notification). */
-    val received = MutableSharedFlow<Pair<File, String>>(extraBufferCapacity = 16)
+    val received = MutableSharedFlow<Received>(extraBufferCapacity = 16)
+
+    // ------------------------------------------------------------------ clipboard, notifications, battery
+
+    /** The last text we put on the clipboard from the computer, so it isn't sent straight back. */
+    @Volatile private var lastClip: String? = null
+
+    /**
+     * Sends copied text to the connected computers (PROTOCOL.md section 5, "clip"). Returns true when it went out.
+     * Without [force], text that came from the computer (or was already sent) isn't sent again.
+     */
+    fun shareClipboard(text: String, force: Boolean = false): Boolean {
+        if (!store.shareClipboard || text.isEmpty() || text.length > 200_000 || (!force && text == lastClip)) return false
+        lastClip = text
+        var sent = false
+        for (s in sessions.value) if (s.has("clip")) runCatching { s.sendEvent(JSONObject().put("ev", "clip").put("text", text)); sent = true }
+        return sent
+    }
+
+    private fun receiveClipboard(text: String) {
+        if (!store.shareClipboard || text.isEmpty() || text.length > 200_000) return
+        lastClip = text
+        main.post {
+            runCatching {
+                ctx.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("גשר בלוטוס", text))
+            }.onFailure { Log.w("clipboard: ${it.message}") }
+        }
+    }
+
+    /** A notification that appeared on this phone, for the computers (PROTOCOL.md section 5, "notif"). */
+    fun forwardNotification(app: String, title: String, text: String) {
+        if (!store.forwardNotifications) return
+        val ev = JSONObject().put("ev", "notif").put("app", app).put("title", title).put("text", text.take(2000))
+        for (s in sessions.value) if (s.has("notif")) runCatching { s.sendEvent(ev) }
+    }
+
+    @Volatile private var battery = -1
+    @Volatile private var charging = false
+
+    private fun watchBattery() {
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+                val pct = if (level < 0) -1 else level * 100 / scale
+                val plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+                if (pct == battery && plugged == charging) return
+                battery = pct
+                charging = plugged
+                bg.execute { for (s in sessions.value) sendBattery(s) }
+            }
+        }
+        runCatching { ctx.applicationContext.registerReceiver(r, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) }
+    }
+
+    private fun sendBattery(s: Session) {
+        if (battery < 0 || !s.has("battery")) return
+        runCatching { s.sendEvent(JSONObject().put("ev", "battery").put("level", battery).put("charging", charging)) }
+    }
 
     // ------------------------------------------------------------------ screen sharing
 
@@ -237,13 +332,13 @@ class Bridge(private val ctx: Context) : RequestHandler {
 
     // ------------------------------------------------------------------ outgoing
 
-    fun sessionFor(address: String): Session? = sessions.value.firstOrNull { it.peerAddress == address }
+    fun sessionForAddress(address: String): Session? = sessions.value.firstOrNull { it.peerAddress == address }
 
     /** Blocking; call from a background thread. */
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice): Session {
         val addr = key(device.address)
-        sessionFor(addr)?.let { return it }
+        sessionForAddress(addr)?.let { return it }
         runCatching { adapter()?.cancelDiscovery() }
         val sock = device.createRfcommSocketToServiceRecord(SERVICE_UUID)
         try {
@@ -271,9 +366,23 @@ class Bridge(private val ctx: Context) : RequestHandler {
         older.forEach { it.close() }
         s.onClosed = { list.remove(it); publish() }
         s.onChanged = { publish() }
+        // A dropped Wi-Fi link comes back by itself within seconds, not only on the 30-second announcement.
+        s.onWifiLost = {
+            bg.execute {
+                for (wait in listOf(2000L, 8000L)) {
+                    Thread.sleep(wait)
+                    if (s.closed || s.hasWifi) break
+                    wifi.refresh(s)
+                }
+            }
+        }
         s.attach(link)
         wifi.announce(s)
         publish()
+        bg.execute {
+            sendBattery(s)
+            resumeInterrupted(s.peerFp)
+        }
         return s
     }
 
@@ -288,48 +397,97 @@ class Bridge(private val ctx: Context) : RequestHandler {
             try { openDirect(s) } catch (e: IllegalStateException) { throw RemoteException("io", e.message ?: "הרשת הישירה לא נפתחה") }
             JSONObject().put("ok", true)
         }
+        "ring" -> {
+            Ring.start(ctx, displayName(s))
+            JSONObject().put("ok", true)
+        }
+        "log" -> JSONObject().put("ok", true).put("text", Log.tail(64 * 1024))
         else -> files.handle(s, id, req)
     }
 
     override fun onEvent(s: Session, ev: JSONObject) {
-        if (!ScreenSource.onEvent(s, ev)) wifi.onEvent(s, ev)
+        if (ScreenSource.onEvent(s, ev)) return
+        when (ev.str("ev")) {
+            "clip" -> receiveClipboard(ev.str("text") ?: "")
+            else -> wifi.onEvent(s, ev)
+        }
     }
 
     // ------------------------------------------------------------------ transfers
 
-    /** Runs transfers one at a time. [after] gets true when this one succeeded. */
-    fun queue(t: Transfer, work: () -> Unit, after: ((Boolean) -> Unit)? = null) {
-        transfers.value = listOf(t) + transfers.value
-        transferExec.execute {
-            var ok = false
-            if (t.cancel.isCancelled) {
-                t.status = "בוטל"
+    /**
+     * Runs transfers one at a time, each on its device's current session. When the connection drops in the middle,
+     * the transfer waits and continues from where it stopped once the device is back.
+     * [after] gets true when it finally succeeded.
+     */
+    fun queue(t: Transfer, after: ((Boolean) -> Unit)? = null) {
+        if (after != null) t.after = after
+        if (transfers.value.none { it === t }) transfers.value = listOf(t) + transfers.value
+        transferExec.execute { runTransfer(t) }
+    }
+
+    private fun runTransfer(t: Transfer) {
+        var ok = false
+        if (t.cancel.isCancelled) {
+            t.status = "בוטל"
+        } else {
+            val s = sessionFor(t.peerFp)
+            if (s == null) {
+                t.interrupted = true
+                t.status = "ממתין לחיבור. ימשיך כשהמכשיר יתחבר שוב."
             } else {
                 t.status = "מעביר…"
                 try {
-                    work()
+                    t.work!!(s, t)
                     t.status = "הושלם ✓"
                     ok = true
-                } catch (e: CancellationException) {
-                    t.status = "בוטל"
                 } catch (e: Exception) {
-                    t.status = "שגיאה: ${com.btbridge.app.core.Heb.of(e)}"
-                    Log.w("transfer ${t.name}: $e")
+                    val why = com.btbridge.app.core.Heb.of(e)
+                    when {
+                        t.cancel.isCancelled -> t.status = "בוטל"
+                        s.closed -> {
+                            t.interrupted = true
+                            t.status = "נקטע. ימשיך כשהמכשיר יתחבר שוב."
+                        }
+                        (e is CancellationException || linkErrors.any { why.contains(it) }) && t.attempts < 5 -> {
+                            // Only the Wi-Fi link dropped; Bluetooth is still up. Go on right away from where it stopped.
+                            t.status = "החיבור התחלף. ממשיך…"
+                            t.active = false
+                            t.restart()
+                            transferExec.execute { runTransfer(t) }
+                            return
+                        }
+                        else -> {
+                            t.status = "שגיאה: $why"
+                            Log.w("transfer ${t.name}: $e")
+                        }
+                    }
                 }
             }
-            t.active = false
-            tick.value++
-            runCatching { after?.invoke(ok) }
         }
+        t.active = false
+        tick.value++
+        if (!t.interrupted) runCatching { t.after?.invoke(ok) }
     }
 
-    fun clearFinished() { transfers.value = transfers.value.filter { it.active } }
+    /** The user pressed "continue", or the device came back. */
+    fun resume(t: Transfer) {
+        if (t.active || t.work == null) return
+        t.restart()
+        queue(t)
+    }
+
+    private fun resumeInterrupted(fp: String) {
+        transfers.value.filter { it.interrupted && !it.active && it.peerFp == fp }.reversed().forEach { resume(it) }
+    }
+
+    fun clearFinished() { transfers.value = transfers.value.filter { it.active || it.interrupted } }
 
     fun runInBackground(f: () -> Unit) = bg.execute(f)
 
     // ------------------------------------------------------------------ storage and network
 
-    private fun roots(): List<Root> {
+    fun roots(): List<Root> {
         val out = mutableListOf<Root>()
         val ext = Environment.getExternalStorageDirectory()
         for ((name, rel) in listOf(
