@@ -25,6 +25,26 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Checklist
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.MutableFloatState
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.ui.input.pointer.pointerInput
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.Checkbox
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import com.btbridge.app.core.SearchResult
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreateNewFolder
@@ -118,6 +138,15 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
     var renaming by remember { mutableStateOf<RemoteItem?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var copyTarget by remember { mutableStateOf<List<RemoteItem>?>(null) }
+    /** "Mark several" mode: taps tick items instead of opening them, even before the first one is ticked. */
+    var selecting by remember { mutableStateOf(false) }
+    val inSelect = selecting || selected.isNotEmpty()
+    /** Search: the box is open, the text, and the results (null while a folder is shown). */
+    var searchOpen by remember { mutableStateOf(false) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var results by remember(s) { mutableStateOf<SearchResult?>(null) }
+    var resultsFor by remember { mutableStateOf("") }
+    var savedDialog by remember { mutableStateOf(false) }
     val transfers by b.transfers.collectAsState()
     val sessions by b.sessions.collectAsState()
     val live = sessions.firstOrNull { it === s }
@@ -134,6 +163,7 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
                 if (remember && p != path && listing != null) history += path
                 listing = l
                 path = p
+                results = null
                 selected.clear()
             } catch (e: Exception) {
                 message = com.btbridge.app.core.Heb.of(e)
@@ -142,6 +172,27 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
             }
         }
     }
+
+    /** Searches this folder and all its subfolders on the other device (PROTOCOL.md section 4, "search"). */
+    fun search() {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        scope.launch {
+            loading = true
+            try {
+                results = withContext(Dispatchers.IO) { RemoteFs.search(s, path, q) }
+                resultsFor = q
+                selected.clear()
+            } catch (e: Exception) {
+                message = com.btbridge.app.core.Heb.of(e)
+            } finally {
+                loading = false
+            }
+        }
+    }
+
+    /** After a change: the search results again when searching, otherwise the folder. */
+    fun refresh() { if (results != null) search() else load(path, remember = false) }
 
     fun refreshAfter(target: String): (Boolean) -> Unit = { _ ->
         scope.launch { if (path == target) load(target, remember = false) }
@@ -152,7 +203,9 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
     /** Phone Back and the arrow at the top do the same: one step back, and only from the first folder to the device list. */
     fun goBack() {
         when {
-            selected.isNotEmpty() -> selected.clear()
+            inSelect -> { selected.clear(); selecting = false }
+            results != null -> results = null
+            searchOpen -> searchOpen = false
             history.isNotEmpty() -> load(history.removeAt(history.lastIndex), remember = false)
             else -> onBack()
         }
@@ -198,16 +251,27 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
     }
 
     val inFolder = path.isNotEmpty()
+    val inResults = results != null
     storeVersion.let { }
+    val saved = b.store.savedFor(s.peerFp)
     val (sortBy, sortDesc) = b.store.sortFor(s.peerFp, path) ?: FileOrder.default(path)
     // The virtual root keeps the other side's order (quick folders, then drives).
-    val items = listing?.items.orEmpty().let { if (inFolder) FileOrder.sort(it, sortBy, sortDesc) else it }
-    val chosen = items.filter { it.path in selected }
+    val folderItems = listing?.items.orEmpty().let { if (inFolder) FileOrder.sort(it, sortBy, sortDesc) else it }
+    // Rows on screen, each with "is it a saved place": search results, or the folder.
+    // The list of places starts with the saved places on this device.
+    val rows: List<Pair<RemoteItem, Boolean>> = results?.items?.map { it to false }
+        ?: if (inFolder) folderItems.map { it to false }
+        else saved.map { RemoteItem(it.name, it.path, it.isDir, 0, 0) to true } + folderItems.map { it to false }
+    val items = rows.map { it.first }
+    val chosen = items.filter { it.path in selected }.distinctBy { it.path }
+    // Renaming and deleting need a real folder (or search results), not the list of places.
+    val canEdit = inFolder || inResults
     var sortMenu by remember { mutableStateOf(false) }
 
     fun downloadChosen(dest: File, label: String) {
         val list = chosen
         selected.clear()
+        selecting = false
         Toast.makeText(ctx, "יורד אל: $label", Toast.LENGTH_SHORT).show()
         download(scope, s, list, dest) { message = it }
     }
@@ -217,25 +281,48 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
             TopAppBar(
                 title = {
                     Column {
-                        Text(if (selected.isEmpty()) b.displayName(s) else "נבחרו ${selected.size}", maxLines = 1)
+                        Text(when {
+                            inSelect -> "נבחרו ${selected.size}"
+                            inResults -> "חיפוש: $resultsFor"
+                            else -> b.displayName(s)
+                        }, maxLines = 1)
                         Text(live?.linkText ?: "מנותק", style = MaterialTheme.typography.bodySmall)
                     }
                 },
                 navigationIcon = {
                     IconButton(onClick = { goBack() }) {
-                        Icon(if (selected.isNotEmpty()) Icons.Filled.Close else Icons.AutoMirrored.Filled.ArrowBack, "חזור")
+                        Icon(if (inSelect) Icons.Filled.Close else Icons.AutoMirrored.Filled.ArrowBack, "חזור")
                     }
                 },
                 actions = {
-                    if (selected.isNotEmpty()) {
-                        IconButton(onClick = { selected.clear(); selected.addAll(items.map { it.path }) }) { Icon(Icons.Filled.SelectAll, "בחר הכל") }
+                    if (inSelect) {
+                        IconButton(onClick = {
+                            val all = items.map { it.path }.distinct()
+                            if (selected.size == all.size) selected.clear() else { selected.clear(); selected.addAll(all) }
+                        }) { Icon(Icons.Filled.SelectAll, "בחר הכל") }
                     } else {
+                        IconButton(onClick = { searchOpen = !searchOpen }) { Icon(Icons.Filled.Search, "חיפוש") }
                         if (s.peerOs == "windows") IconButton(onClick = onRemote) { Icon(Icons.Filled.DesktopWindows, "מסך המחשב") }
                         IconButton(onClick = onTransfers) { Icon(Icons.Filled.SwapVert, "העברות") }
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "עוד") }
                         DropdownMenu(menu, { menu = false }) {
                             DropdownMenuItem(text = { Text("רענן") }, leadingIcon = { Icon(Icons.Filled.Refresh, null) },
-                                onClick = { menu = false; load(path, remember = false) })
+                                onClick = { menu = false; refresh() })
+                            DropdownMenuItem(text = { Text("בחר כמה פריטים") }, leadingIcon = { Icon(Icons.Filled.Checklist, null) },
+                                onClick = { menu = false; selecting = true })
+                            DropdownMenuItem(text = { Text("שמורים…") }, leadingIcon = { Icon(Icons.Filled.Star, null) },
+                                onClick = { menu = false; savedDialog = true })
+                            if (inFolder && !inResults) {
+                                val here = b.store.isSaved(s.peerFp, path)
+                                DropdownMenuItem(
+                                    text = { Text(if (here) "הסר את התיקייה הזו מהשמורים" else "שמור את התיקייה הזו") },
+                                    leadingIcon = { Icon(if (here) Icons.Filled.StarBorder else Icons.Filled.Star, null) },
+                                    onClick = {
+                                        menu = false
+                                        if (here) b.store.removeSaved(s.peerFp, path)
+                                        else b.store.addSaved(s.peerFp, SavedPlace(folderName(path), path, true))
+                                    })
+                            }
                             listing?.parent?.let { up ->
                                 DropdownMenuItem(text = { Text("לתיקייה שמעל") }, leadingIcon = { Icon(Icons.Filled.ArrowUpward, null) },
                                     onClick = { menu = false; load(up) })
@@ -265,12 +352,19 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
                     if (chosen.none { it.isDir }) BarAction(Icons.Filled.Share, "שתף") {
                         val list = chosen
                         selected.clear()
+                        selecting = false
                         share(ctx, s, list) { message = it }
                     }
-                    if (selected.size == 1 && inFolder) BarAction(Icons.Filled.DriveFileRenameOutline, "שנה שם") {
+                    if (chosen.any { !b.store.isSaved(s.peerFp, it.path) }) BarAction(Icons.Filled.Star, "שמור") {
+                        chosen.forEach { b.store.addSaved(s.peerFp, SavedPlace(it.name, it.path, it.isDir)) }
+                        selected.clear()
+                        selecting = false
+                        Toast.makeText(ctx, "נשמר. אפשר לחזור אליו מרשימת המקומות או מ\"שמורים\".", Toast.LENGTH_SHORT).show()
+                    }
+                    if (selected.size == 1 && canEdit) BarAction(Icons.Filled.DriveFileRenameOutline, "שנה שם") {
                         renaming = items.firstOrNull { it.path == selected[0] }
                     }
-                    if (inFolder) BarAction(Icons.Filled.Delete, "מחק") { confirmDelete = true }
+                    if (canEdit) BarAction(Icons.Filled.Delete, "מחק") { confirmDelete = true }
                 }
             }
         },
@@ -278,7 +372,21 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
         Column(Modifier.padding(pad).fillMaxSize()) {
             if (path.isNotEmpty()) Text(path, Modifier.fillMaxWidth().padding(16.dp, 4.dp, 16.dp, 0.dp),
                 style = MaterialTheme.typography.bodySmall.copy(textDirection = TextDirection.Ltr), maxLines = 2)
-            if (inFolder) Box(Modifier.padding(horizontal = 8.dp)) {
+            if (searchOpen || inResults) Row(Modifier.fillMaxWidth().padding(12.dp, 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(query, { query = it }, Modifier.weight(1f), singleLine = true,
+                    placeholder = { Text(if (inFolder) "חיפוש בתיקייה הזו ובתתי-התיקיות" else "חיפוש בכל התיקיות של המשתמש") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { search() }))
+                IconButton(onClick = { search() }, enabled = query.isNotBlank()) { Icon(Icons.Filled.Search, "חפש") }
+            }
+            results?.let { r ->
+                Text("נמצאו ${r.items.size}" + (if (r.more) ". מוצגות רק הראשונות. כדאי לחפש בתיקייה מצומצמת יותר." else ".") +
+                    " \"חזור\" חוזר לתיקייה.", Modifier.padding(16.dp, 0.dp, 16.dp, 4.dp),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (selecting && selected.isEmpty()) Text("הקש על הפריטים שאתה רוצה לסמן.", Modifier.padding(16.dp, 0.dp, 16.dp, 4.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            if (inFolder && !inResults) Box(Modifier.padding(horizontal = 8.dp)) {
                 TextButton(onClick = { sortMenu = true }) {
                     Icon(Icons.AutoMirrored.Filled.Sort, null)
                     Text("  " + FileOrder.label(sortBy, sortDesc), style = MaterialTheme.typography.bodySmall)
@@ -300,32 +408,55 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             val active = transfers.firstOrNull { it.active && it.status == "מעביר…" }
             if (active != null) Box(Modifier.clickable(onClick = onTransfers)) { TransferRow(active) }
-            if (selected.isEmpty() && inFolder && items.any { !it.isDir })
-                Text("הקשה פותחת. לחיצה ארוכה בוחרת, ואז אפשר להוריד, להעתיק לתיקייה בטלפון או לשתף.",
+            if (!inSelect && !inResults && inFolder && items.any { !it.isDir })
+                Text("הקשה פותחת. לחיצה ארוכה (או \"בחר כמה פריטים\" בתפריט) מסמנת, ואז אפשר להוריד, להעתיק לתיקייה בטלפון, לשתף או לשמור.",
                     Modifier.padding(16.dp, 0.dp, 16.dp, 4.dp), style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!loading && items.isEmpty() && listing != null) Text("התיקייה ריקה.", Modifier.padding(16.dp))
-            LazyColumn(Modifier.weight(1f)) {
-                items(items, key = { it.path }) { i ->
+            if (!loading && items.isEmpty() && (listing != null || inResults))
+                Text(if (inResults) "לא נמצא שום דבר עם \"$resultsFor\" בשם." else "התיקייה ריקה.", Modifier.padding(16.dp))
+            val listState = rememberLazyListState()
+            val autoScroll = remember { mutableFloatStateOf(0f) }
+            // The drag handler lives across recompositions, so it reads the rows through this, always up to date.
+            val rowKeys by rememberUpdatedState(rows.map { it.first.path })
+            LaunchedEffect(autoScroll.floatValue) {
+                if (autoScroll.floatValue == 0f) return@LaunchedEffect
+                while (isActive) { listState.scrollBy(autoScroll.floatValue); delay(16) }
+            }
+            LazyColumn(
+                Modifier.weight(1f).dragToSelect(listState, { rowKeys }, selected, autoScroll),
+                state = listState,
+            ) {
+                items(rows, key = { (i, isSaved) -> (if (isSaved) "★" else "") + i.path }) { (i, isSaved) ->
                     val isSel = i.path in selected
                     ListItem(
                         headlineContent = { Text(i.name, maxLines = 2) },
                         supportingContent = {
                             val parts = listOfNotNull(
-                                if (!i.isDir) Transfer.formatSize(i.size) else null,
+                                if (isSaved) "שמור" else null,
+                                if (!i.isDir && !isSaved) Transfer.formatSize(i.size) else null,
                                 if (i.mtime > 0) dateFmt.format(Date(i.mtime)) else null,
                             )
-                            if (parts.isNotEmpty()) Text(parts.joinToString(" · "))
+                            Column {
+                                if (parts.isNotEmpty()) Text(parts.joinToString(" · "))
+                                // In search results: where it is.
+                                if (inResults && i.folder.isNotEmpty()) Text(i.folder, maxLines = 1,
+                                    style = MaterialTheme.typography.bodySmall.copy(textDirection = TextDirection.Ltr),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         },
                         leadingContent = {
-                            Icon(if (i.isDir) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile, null,
-                                tint = if (i.isDir) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (inSelect) Checkbox(isSel, { on -> if (on) selected.add(i.path) else selected.remove(i.path) })
+                            else Icon(when {
+                                isSaved -> Icons.Filled.Star
+                                i.isDir -> Icons.Filled.Folder
+                                else -> Icons.AutoMirrored.Filled.InsertDriveFile
+                            }, null, tint = if (i.isDir || isSaved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
                         },
                         colors = if (isSel) ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else ListItemDefaults.colors(),
                         modifier = Modifier.combinedClick(
                             onClick = {
                                 when {
-                                    selected.isNotEmpty() -> if (isSel) selected.remove(i.path) else selected.add(i.path)
+                                    inSelect -> if (isSel) selected.remove(i.path) else selected.add(i.path)
                                     i.isDir -> load(i.path)
                                     else -> openRemote(s, i)
                                 }
@@ -351,7 +482,8 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
             renaming = null
             if (name == item.name) return@NameDialog
             scope.launch {
-                try { withContext(Dispatchers.IO) { RemoteFs.rename(s, item.path, RemoteFs.join(s, path, name)) }; load(path) }
+                // In search results the item may sit in a subfolder: rename it where it is.
+                try { withContext(Dispatchers.IO) { RemoteFs.rename(s, item.path, RemoteFs.join(s, item.folder.ifEmpty { path }, name)) }; refresh() }
                 catch (e: Exception) { message = com.btbridge.app.core.Heb.of(e) }
             }
         }
@@ -369,7 +501,8 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
                     scope.launch {
                         try { withContext(Dispatchers.IO) { RemoteFs.delete(s, paths) } }
                         catch (e: Exception) { message = com.btbridge.app.core.Heb.of(e) }
-                        load(path)
+                        selecting = false
+                        refresh()
                     }
                 }) { Text("מחק") }
             },
@@ -380,11 +513,86 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
         LocalFolderPicker(onDismiss = { copyTarget = null }) { dir ->
             copyTarget = null
             selected.removeAll(list.map { it.path })
-            Toast.makeText(ctx, "מעתיק אל: ${dir.path}", Toast.LENGTH_SHORT).show()
+            selecting = false
+            Toast.makeText(ctx, "מעתיק אל: ${friendlyPath(dir.path)}", Toast.LENGTH_SHORT).show()
             download(scope, s, list, dir) { message = it }
         }
     }
+    if (savedDialog) AlertDialog(
+        onDismissRequest = { savedDialog = false },
+        title = { Text("שמורים ב${b.displayName(s)}") },
+        text = {
+            if (saved.isEmpty()) Text("עוד אין שמורים. אפשר לשמור את התיקייה הנוכחית מהתפריט, או לסמן פריטים וללחוץ \"שמור\".")
+            else LazyColumn(Modifier.heightIn(max = 400.dp)) {
+                items(saved, key = { it.path }) { p ->
+                    ListItem(
+                        headlineContent = { Text(p.name) },
+                        supportingContent = { Text(p.path, maxLines = 1, style = MaterialTheme.typography.bodySmall.copy(textDirection = TextDirection.Ltr)) },
+                        leadingContent = { Icon(if (p.isDir) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile, null) },
+                        trailingContent = { IconButton(onClick = { b.store.removeSaved(s.peerFp, p.path) }) { Icon(Icons.Filled.Close, "הסר מהשמורים") } },
+                        modifier = Modifier.clickable {
+                            savedDialog = false
+                            if (p.isDir) load(p.path) else openRemote(s, RemoteItem(p.name, p.path, false, 0, 0))
+                        },
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { savedDialog = false }) { Text("סגור") } },
+    )
     message?.let { MessageDialog(it) { message = null } }
+}
+
+/** The last part of a path ("C:\\Users\\x\\Documents" → "Documents"). */
+private fun folderName(path: String): String {
+    val t = path.trimEnd('\\', '/')
+    val cut = t.lastIndexOfAny(charArrayOf('\\', '/'))
+    return if (cut >= 0 && cut < t.length - 1) t.substring(cut + 1) else t
+}
+
+/**
+ * Long press, then drag the finger: every row it passes over is selected, as in the phone's gallery.
+ * Rows that were selected before stay selected. Near the top or bottom edge the list scrolls by itself.
+ */
+private fun Modifier.dragToSelect(
+    state: LazyListState,
+    keys: () -> List<String>,
+    selected: SnapshotStateList<String>,
+    autoScroll: MutableFloatState,
+): Modifier = pointerInput(Unit) {
+    fun indexAt(y: Float): Int? = state.layoutInfo.visibleItemsInfo.firstOrNull { y.toInt() in it.offset until it.offset + it.size }?.index
+    var anchor: Int? = null
+    var last: Int? = null
+    var before: Set<String> = emptySet()
+    fun apply(a: Int, b: Int) {
+        val k = keys()
+        val want = before + (minOf(a, b)..maxOf(a, b)).mapNotNull { k.getOrNull(it) }
+        selected.removeAll { it !in want }
+        want.forEach { if (it !in selected) selected.add(it) }
+    }
+    val edge = 56.dp.toPx()
+    detectDragGesturesAfterLongPress(
+        onDragStart = { pos ->
+            indexAt(pos.y)?.let { i ->
+                before = selected.toSet()
+                anchor = i
+                last = i
+                apply(i, i)
+            }
+        },
+        onDragEnd = { anchor = null; autoScroll.floatValue = 0f },
+        onDragCancel = { anchor = null; autoScroll.floatValue = 0f },
+        onDrag = { change, _ ->
+            val a = anchor ?: return@detectDragGesturesAfterLongPress
+            val y = change.position.y
+            autoScroll.floatValue = when {
+                y > size.height - edge -> (y - (size.height - edge)) / 3f
+                y < edge -> -(edge - y) / 3f
+                else -> 0f
+            }
+            indexAt(y)?.let { i -> if (i != last) { last = i; apply(a, i) } }
+        },
+    )
 }
 
 @Composable

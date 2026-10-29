@@ -166,6 +166,8 @@ class InteropTest {
         val node = Node()
         val dir = Files.createTempDirectory("btb-kt").toFile()
         File(dir, "from-kotlin.bin").writeBytes(pattern(3_000_000))
+        File(dir, "sub").mkdirs()
+        File(dir, "sub/deep-findme.txt").writeText("x")
         val ss = ServerSocket(0, 5, InetAddress.getLoopbackAddress())
         val lockout = Lockout()
         Thread {
@@ -199,6 +201,7 @@ class InteropTest {
         assertTrue(dir.listFiles()!!.none { it.name.endsWith(".btpart") })
         assertTrue("replay test", out.contains("REPLAY refused"))
         assertTrue("resumed download", out.contains("RESUME-DOWNLOAD ok"))
+        assertTrue("search from windows", out.contains("SEARCH ok"))
         assertTrue("clip from windows: ${node.clips}", node.clips.contains("מהמחשב"))
 
         // "Send to device" from Windows landed in the phone's inbox, and "../" was refused.
@@ -228,6 +231,8 @@ class InteropTest {
         val state = Files.createTempDirectory("btb-cs").toFile()
         val dir = Files.createTempDirectory("btb-srv").toFile()
         File(dir, "from-windows.bin").writeBytes(pattern(3_000_000))
+        File(dir, "sub").mkdirs()
+        File(dir, "sub/deep-findme.txt").writeText("x")
         val p = ProcessBuilder(exe, "server", state.path).redirectErrorStream(true).start()
         val winOut = CopyOnWriteArrayList<String>()
         try {
@@ -275,6 +280,10 @@ class InteropTest {
             File(resumed.path + ".btpart").writeBytes(pattern(3_000_000).copyOfRange(0, 1_100_000))
             RemoteFs.download(s, item.path, resumed, Transfer("resumed", false).apply { attempts = 1 }, item.size, item.mtime)
             assertTrue("resumed download", resumed.readBytes().contentEquals(pattern(3_000_000)))
+
+            // Search on the computer: a name inside a subfolder, in any letter case, with its folder.
+            val found = RemoteFs.search(s, dir.path, "FINDME")
+            assertTrue("search: ${found.items.map { it.path }}", found.items.any { it.name == "deep-findme.txt" && it.folder.endsWith("sub") })
 
             val upSrc = pattern(2_500_000)
             val t = Transfer("up", true)

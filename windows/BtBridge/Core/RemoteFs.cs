@@ -6,9 +6,13 @@ namespace BtBridge.Core;
 
 public sealed record RemoteItem(string Name, string Path, bool IsDir, long Size, long Mtime)
 {
-    public string Icon => IsDir ? "📁" : "📄";
+    /// <summary>One of the user's saved places ("שמורים"), shown first in the list of places.</summary>
+    public bool Saved { get; init; }
+    public string Icon => Saved ? "⭐" : IsDir ? "📁" : "📄";
     public string SizeText => IsDir ? "" : Transfer.FormatSize(Size);
     public string DateText => Mtime <= 0 ? "" : DateTimeOffset.FromUnixTimeMilliseconds(Mtime).LocalDateTime.ToString("dd/MM/yyyy HH:mm");
+    /// <summary>The folder that holds it (shown next to search results).</summary>
+    public string Folder => Path.Length > Name.Length ? Path[..^Name.Length].TrimEnd('\\', '/') : "";
 }
 
 public sealed record RemoteListing(List<RemoteItem> Items, string? Parent);
@@ -24,16 +28,32 @@ public static class RemoteFs
         {
             var res = await s.RequestAsync(new JsonObject { ["op"] = "list", ["path"] = path, ["offset"] = items.Count }, ct);
             parent = res["parent"]?.GetValue<string>();
-            foreach (var n in res["items"]!.AsArray())
-            {
-                var o = n!.AsObject();
-                items.Add(new RemoteItem(
-                    o["n"]!.GetValue<string>(), o["p"]!.GetValue<string>(), o["d"]!.GetValue<bool>(),
-                    o["s"]?.GetValue<long>() ?? 0, o["m"]?.GetValue<long>() ?? 0));
-            }
+            items.AddRange(Items(res));
             if (res["more"]?.GetValue<bool>() != true) break;
         }
         return new RemoteListing(items, parent);
+    }
+
+    private static IEnumerable<RemoteItem> Items(JsonObject res)
+    {
+        foreach (var n in res["items"]!.AsArray())
+        {
+            var o = n!.AsObject();
+            yield return new RemoteItem(
+                o["n"]!.GetValue<string>(), o["p"]!.GetValue<string>(), o["d"]!.GetValue<bool>(),
+                o["s"]?.GetValue<long>() ?? 0, o["m"]?.GetValue<long>() ?? 0);
+        }
+    }
+
+    /// <summary>
+    /// Files and folders whose name contains <paramref name="q"/>, under <paramref name="path"/> and its subfolders
+    /// (PROTOCOL.md section 4, "search"). More is true when the other side stopped early (too many results, or too long).
+    /// </summary>
+    public static async Task<(List<RemoteItem> Items, bool More)> SearchAsync(Session s, string path, string q, CancellationToken ct = default)
+    {
+        if (!s.Has("search")) throw new RemoteException("unsupported", "במכשיר השני מותקנת גרסה בלי חיפוש. עדכן אותו.");
+        var res = await s.RequestAsync(new JsonObject { ["op"] = "search", ["path"] = path, ["q"] = q, ["max"] = 500 }, ct, timeoutSec: 60);
+        return (Items(res).ToList(), res["more"]?.GetValue<bool>() == true);
     }
 
     public static Task MkdirAsync(Session s, string path) =>

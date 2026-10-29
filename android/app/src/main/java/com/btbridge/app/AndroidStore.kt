@@ -16,6 +16,9 @@ import java.security.KeyPair
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 
+/** A folder or file on another device that the user saved for quick access. */
+data class SavedPlace(val name: String, val path: String, val isDir: Boolean)
+
 /** Settings, password key and trusted devices, in the app's private storage. */
 class AndroidStore(val ctx: Context) : Store {
     private val prefs = ctx.getSharedPreferences("btbridge", Context.MODE_PRIVATE)
@@ -81,6 +84,35 @@ class AndroidStore(val ctx: Context) : Store {
 
     fun setSort(fp: String, path: String, by: String, desc: Boolean) {
         prefs.edit().putString("sort:$fp|$path", "$by|${if (desc) "desc" else "asc"}").apply()
+        version.value++
+    }
+
+    /** Saved places ("שמורים") on a device, by its fingerprint, in the order they were added. */
+    @Synchronized
+    fun savedFor(fp: String): List<SavedPlace> {
+        val arr = JSONArray(prefs.getString("saved:$fp", "[]"))
+        return (0 until arr.length()).map {
+            val o = arr.getJSONObject(it)
+            SavedPlace(o.getString("name"), o.getString("path"), o.optBoolean("dir", true))
+        }
+    }
+
+    fun isSaved(fp: String, path: String) = savedFor(fp).any { it.path == path }
+
+    @Synchronized
+    fun addSaved(fp: String, p: SavedPlace) {
+        val list = savedFor(fp)
+        if (list.any { it.path == p.path }) return
+        writeSaved(fp, list + p)
+    }
+
+    @Synchronized
+    fun removeSaved(fp: String, path: String) = writeSaved(fp, savedFor(fp).filterNot { it.path == path })
+
+    private fun writeSaved(fp: String, list: List<SavedPlace>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(JSONObject().put("name", it.name).put("path", it.path).put("dir", it.isDir)) }
+        prefs.edit().putString("saved:$fp", arr.toString()).apply()
         version.value++
     }
 
