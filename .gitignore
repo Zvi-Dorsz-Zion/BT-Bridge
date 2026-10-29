@@ -1,0 +1,11 @@
+bin/
+obj/
+windows/publish/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+# Signing key: back it up separately, never in a public repo
+android/signing/
+*.apk
+*.exe

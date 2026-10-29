@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">מאפשר למחשב שלך, דרך גשר בלוטוס, להקיש, להחליק, ללחוץ על כפתורי המערכת ולהקליד בטלפון בזמן שליטה מרחוק. פועל רק כשהמחשב פתח שליטה, ורק ממחשב שאושר בסיסמה.</string>
+</resources>
