@@ -70,8 +70,19 @@ class Bridge(private val ctx: Context) : RequestHandler {
     val store = AndroidStore(ctx)
     val me = store.identity()
     private val files = FileService({ store.deviceName }, "android", Environment.getExternalStorageDirectory(), ::roots,
-        { store.downloadDir }, ::onReceived)
+        { store.downloadDir }, ::onReceived, ::mediaScan)
     val hotspot = DirectHotspot(ctx)
+
+    /**
+     * Tells Android about files that were added, renamed or deleted, so they show up right away in "Downloads",
+     * the gallery and file managers (those read the media index, not the disk). The app's own folders are skipped.
+     */
+    fun mediaScan(files: List<File>) {
+        val own = listOf(ctx.cacheDir.path, ctx.filesDir.path, ctx.getExternalFilesDir(null)?.path).filterNotNull()
+        val paths = files.map { it.path }.filter { p -> own.none { p.startsWith(it) } }
+        if (paths.isEmpty()) return
+        android.media.MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null, null)
+    }
     val wifi = WifiLinks({ sessions.value }, ::localIps, ::connectTcp)
     private val lockout = Lockout()
     private val list = CopyOnWriteArrayList<Session>()

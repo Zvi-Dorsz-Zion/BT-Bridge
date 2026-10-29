@@ -97,6 +97,11 @@ class FileService(
     private val inboxDir: () -> File = { home },
     /** A file arrived through "send to device"; the flag says it is an update of this app (PROTOCOL.md section 4). */
     private val onReceived: ((Session, File, Boolean) -> Unit)? = null,
+    /**
+     * Files that were added, renamed or deleted here by the other device. On Android they are reported to the
+     * media index, otherwise "Downloads" and the gallery wouldn't show them until the system notices by itself.
+     */
+    private val onChanged: ((List<File>) -> Unit)? = null,
 ) {
     fun handle(s: Session, id: Int, req: JSONObject): JSONObject? = when (val op = req.str("op")) {
         "info" -> JSONObject().put("name", deviceName()).put("os", os).put("sep", "/").put("home", home.path)
@@ -113,15 +118,20 @@ class FileService(
             if (!from.exists()) throw RemoteException("notfound", "לא נמצא: ${from.path}")
             if (to.exists()) throw RemoteException("exists", "כבר קיים: ${to.path}")
             if (!from.renameTo(to)) throw RemoteException("io", "שינוי השם נכשל")
+            changed(listOf(from, to))
             ok()
         }
         "delete" -> {
             val arr = req.getJSONArray("paths")
             val failed = mutableListOf<String>()
+            val gone = mutableListOf<File>()
             for (i in 0 until arr.length()) {
                 val f = File(arr.getString(i))
-                if (f.exists() && !f.deleteRecursively()) failed += f.name
+                if (!f.exists()) continue
+                val inside = if (f.isDirectory) f.walkTopDown().filter { it.isFile }.toList() else listOf(f)
+                if (f.deleteRecursively()) gone += inside else failed += f.name
             }
+            changed(gone)
             if (failed.isNotEmpty()) throw RemoteException("io", "לא נמחק: " + failed.joinToString(", "))
             ok().put("recycled", false)
         }
@@ -132,6 +142,10 @@ class FileService(
     }
 
     private fun ok() = JSONObject().put("ok", true)
+
+    private fun changed(files: List<File>) {
+        if (files.isNotEmpty()) runCatching { onChanged?.invoke(files) }.onFailure { Log.w("media index: ${it.message}") }
+    }
 
     // ------------------------------------------------------------------ search
 
@@ -261,6 +275,7 @@ class FileService(
                     if (overwrite) finalTarget.delete()
                     if (!part.renameTo(finalTarget)) throw RemoteException("io", "שמירת הקובץ נכשלה")
                     if (mtime > 0) finalTarget.setLastModified(mtime)
+                    changed(listOf(finalTarget))
                     s.sendDone(id, JSONObject().put("ok", true).put("path", finalTarget.path))
                     if (inbox) onReceived?.invoke(s, finalTarget, req.bool("update") == true)
                 } catch (e: Exception) {
