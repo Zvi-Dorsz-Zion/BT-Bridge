@@ -32,7 +32,7 @@ public sealed class DeviceItem
     public bool IsHeader => false;
 
     public string Sub =>
-        Session != null ? "מחובר · " + Session.LinkText
+        Session != null ? "מחובר · " + Session.LinkText + MainWindow.BatteryText(Session)
         : Connecting ? "מתחבר…"
         : Trusted ? "מוכר · לא מחובר"
         : "מזווג · לחיצה כפולה מתחברת";
@@ -66,7 +66,11 @@ public partial class MainWindow : Window
             var d = new PasswordWindow(peer, wrong) { Owner = IsVisible ? this : null };
             return d.ShowDialog() == true ? d.Answer : null;
         });
-        _b.SessionsChanged += () => Dispatcher.BeginInvoke(RenderDevices);
+        _b.SessionsChanged += () => Dispatcher.BeginInvoke(() =>
+        {
+            RenderDevices();
+            ResumeInterrupted();
+        });
         _b.Received += (s, path) => Dispatcher.BeginInvoke(() =>
         {
             _transfers.Insert(0, Transfer.Finished(Path.GetFileName(path), path, "התקבל מ-" + _b.DisplayName(s)));
@@ -205,6 +209,7 @@ public partial class MainWindow : Window
         MenuConnect.IsEnabled = d is { Session: null, Address: not null, Connecting: false };
         MenuDisconnect.IsEnabled = d.Session != null;
         MenuForget.IsEnabled = d.Trusted;
+        MenuLog.IsEnabled = d.Session?.Has("log") == true;
     }
 
     private void ShowSelected()
@@ -214,6 +219,7 @@ public partial class MainWindow : Window
         DisconnectBtn.IsEnabled = d?.Session != null;
         Toolbar.IsEnabled = PathBox.IsEnabled = SessionActions.IsEnabled = d?.Session != null;
         SessionActions.Visibility = d?.Session != null ? Visibility.Visible : Visibility.Collapsed;
+        if (d?.Session == null) VersionNotice.Visibility = Visibility.Collapsed;
 
         if (d?.Session == null)
         {
@@ -230,8 +236,11 @@ public partial class MainWindow : Window
         }
 
         HeaderText.Text = d.Name;
-        HeaderSub.Text = d.Session.LinkText + (_b.Direct.Joined ? " · רשת ישירה" : "");
-        SessionActions.Children[0].Visibility = d.Session.PeerOs == "android" ? Visibility.Visible : Visibility.Collapsed;
+        HeaderSub.Text = d.Session.LinkText + (_b.Direct.Joined ? " · רשת ישירה" : "") + BatteryText(d.Session);
+        bool phone = d.Session.PeerOs == "android";
+        PhoneScreenBtn.Visibility = phone ? Visibility.Visible : Visibility.Collapsed;
+        RingBtn.Visibility = phone && d.Session.Has("ring") ? Visibility.Visible : Visibility.Collapsed;
+        ShowVersionNotice(d.Session);
         if (_current != d.Session)
         {
             _current = d.Session;
@@ -304,6 +313,74 @@ public partial class MainWindow : Window
         new PhoneScreenWindow(s, _b.DisplayName(s)).Show();
     }
 
+    public static string BatteryText(Session s) =>
+        s.Battery < 0 ? "" : $" · סוללה {s.Battery}%" + (s.Charging ? " (בטעינה)" : "");
+
+    /// <summary>"Ring the phone": it plays its alarm sound for 30 seconds, even when it is on silent.</summary>
+    private async void Ring_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is not { } s) return;
+        try
+        {
+            await s.RequestAsync(new System.Text.Json.Nodes.JsonObject { ["op"] = "ring" });
+            ((App)Application.Current).Balloon($"{_b.DisplayName(s)} מצלצל עכשיו. אפשר להפסיק מההתראה בטלפון.");
+        }
+        catch (Exception ex) { Err(ex, "הצלצול לא התחיל."); }
+    }
+
+    /// <summary>
+    /// When the phone has an older version than this program, offers to send it the matching app
+    /// (it travels inside this program). When the phone is newer, suggests updating the computer.
+    /// </summary>
+    private void ShowVersionNotice(Session s)
+    {
+        int cmp = AppInfo.Compare(s.PeerApp, AppInfo.Version);
+        if (s.PeerOs == "android" && cmp < 0 && s.Has("update") && PhoneUpdate.Available)
+        {
+            VersionText.Text = $"בטלפון מותקנת גרסה {s.PeerApp}, ובמחשב גרסה {AppInfo.Version}. אפשר לשלוח לטלפון את הגרסה החדשה.";
+            SendUpdateBtn.Visibility = Visibility.Visible;
+            VersionNotice.Visibility = Visibility.Visible;
+        }
+        else if (cmp > 0)
+        {
+            VersionText.Text = $"ב\"{_b.DisplayName(s)}\" מותקנת גרסה חדשה יותר ({s.PeerApp}). כדאי לעדכן גם את התוכנה במחשב (כרגע {AppInfo.Version}).";
+            SendUpdateBtn.Visibility = Visibility.Collapsed;
+            VersionNotice.Visibility = Visibility.Visible;
+        }
+        else VersionNotice.Visibility = Visibility.Collapsed;
+    }
+
+    private async void SendUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is not { } s) return;
+        string file;
+        try { file = PhoneUpdate.Extract(); }
+        catch (Exception ex) { Err(ex, "לא הצלחתי להכין את קובץ העדכון."); return; }
+        await MaybeFast(s, new FileInfo(file).Length);
+        var name = Path.GetFileName(file);
+        Transfer t = null!;
+        t = new Transfer
+        {
+            Name = name, Upload = true, LocalPath = file, PeerFp = s.PeerFp,
+            Work = (ss, ct) => RemoteFs.UploadAsync(ss, file, name, t, ct, inbox: true, update: true),
+        };
+        if (await Queue(t))
+            ((App)Application.Current).Balloon("העדכון נשלח. בטלפון: הקש על ההתראה \"התקבל עדכון\" כדי להתקין.");
+    }
+
+    private async void DeviceLog_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected?.Session is not { } s) return;
+        try
+        {
+            var res = await s.RequestAsync(new System.Text.Json.Nodes.JsonObject { ["op"] = "log" });
+            var f = Path.Combine(TempFiles.NewDir("יומן"), $"יומן {_b.DisplayName(s)}.txt");
+            await File.WriteAllTextAsync(f, res["text"]?.GetValue<string>() ?? "");
+            OpenLocal(f);
+        }
+        catch (Exception ex) { Err(ex, "היומן לא התקבל."); }
+    }
+
     private async void SendTo_Click(object sender, RoutedEventArgs e)
     {
         if (_current is not { } s) return;
@@ -328,8 +405,13 @@ public partial class MainWindow : Window
         await MaybeFast(s, files.Sum(f => new FileInfo(f.Local).Length));
         await Task.WhenAll(files.Select(f =>
         {
-            var t = new Transfer { Name = f.Rel, Upload = true, LocalPath = f.Local };
-            return Queue(t, ct => RemoteFs.UploadAsync(s, f.Local, f.Rel, t, ct, inbox: true));
+            Transfer t = null!;
+            t = new Transfer
+            {
+                Name = f.Rel, Upload = true, LocalPath = f.Local, PeerFp = s.PeerFp,
+                Work = (ss, ct) => RemoteFs.UploadAsync(ss, f.Local, f.Rel, t, ct, inbox: true),
+            };
+            return Queue(t);
         }));
     }
 
@@ -411,7 +493,7 @@ public partial class MainWindow : Window
             foreach (var i in sel)
             {
                 if (i.IsDir) await CollectFolderDownload(s, i, dir, jobs);
-                else jobs.Add(QueueDownload(s, i.Path, Path.Combine(dir, i.Name), i.Name));
+                else jobs.Add(QueueDownload(s, i, Path.Combine(dir, i.Name)));
                 top.Add(Path.Combine(dir, i.Name));
             }
         }
@@ -475,10 +557,16 @@ public partial class MainWindow : Window
     {
         if (i.IsDir) { await Navigate(i.Path); return; }
         if (_current is not { } s) return;
+        // Opened before and still here: no need to bring it again.
+        if (ViewCache.Find(s.PeerFp, i) is { } cached) { OpenLocal(cached); return; }
         var dir = TempFiles.NewDir("צפייה");
         var local = Path.Combine(dir, i.Name);
         await MaybeFast(s, i.Size);
-        if (await QueueDownload(s, i.Path, local, i.Name)) OpenLocal(local);
+        if (await QueueDownload(s, i, local))
+        {
+            ViewCache.Add(s.PeerFp, i, local);
+            OpenLocal(local);
+        }
     }
 
     private static void OpenLocal(string path)
@@ -547,45 +635,120 @@ public partial class MainWindow : Window
 
     // ---------------------------------------------------------------- transfers
 
-    /// <summary>Runs transfers one at a time. Returns true when this one finished successfully.</summary>
-    private async Task<bool> Queue(Transfer t, Func<CancellationToken, Task> work)
+    /// <summary>Errors that mean "the connection went away", not "this file can't be transferred".</summary>
+    private static readonly string[] LinkErrors = { "החיבור נותק", "החיבור נסגר", "ההעברה נתקעה", "אין תשובה מהמכשיר השני" };
+
+    /// <summary>Adds a transfer to the list and runs it. Returns true when it finished successfully.</summary>
+    private Task<bool> Queue(Transfer t)
     {
         _transfers.Insert(0, t);
-        try { await _queue.WaitAsync(t.Cts.Token); }
-        catch (OperationCanceledException)
-        {
-            t.Status = "בוטל";
-            t.Active = false;
-            return false;
-        }
-        try
-        {
-            t.Status = "מעביר…";
-            await work(t.Cts.Token);
-            t.Tick();
-            t.Status = "הושלם ✓";
-            return true;
-        }
-        catch (OperationCanceledException) { t.Status = "בוטל"; }
-        catch (Exception ex) { t.Status = "שגיאה: " + Heb.Of(ex); Log.Write($"transfer {t.Name}: {ex}"); }
-        finally
-        {
-            t.Active = false;
-            _queue.Release();
-        }
-        return false;
+        return Run(t);
     }
 
-    private Task<bool> QueueDownload(Session s, string remote, string local, string name)
+    /// <summary>
+    /// Runs transfers one at a time, each on its device's current connection. When the connection drops in the middle,
+    /// the transfer waits and continues from where it stopped once the device is back (or right away, when only
+    /// the Wi-Fi link dropped and Bluetooth is still up).
+    /// </summary>
+    private async Task<bool> Run(Transfer t)
     {
-        var t = new Transfer { Name = name, LocalPath = local };
-        return Queue(t, ct => RemoteFs.DownloadAsync(s, remote, local, t, ct));
+        while (true)
+        {
+            try { await _queue.WaitAsync(t.Cts.Token); }
+            catch (OperationCanceledException)
+            {
+                t.Status = "בוטל";
+                t.Active = false;
+                return false;
+            }
+            bool again = false;
+            Session? s = null;
+            try
+            {
+                s = _b.Sessions.FirstOrDefault(x => x.PeerFp == t.PeerFp);
+                if (s == null)
+                {
+                    t.Interrupted = true;
+                    t.Status = "ממתין לחיבור. ימשיך כשהמכשיר יתחבר שוב.";
+                    return false;
+                }
+                t.Status = "מעביר…";
+                await t.Work!(s, t.Cts.Token);
+                t.Tick();
+                t.Status = "הושלם ✓";
+                return true;
+            }
+            catch (Exception) when (t.Cts.IsCancellationRequested) { t.Status = "בוטל"; }
+            catch (Exception ex) when (s?.Closed == true)
+            {
+                t.Interrupted = true;
+                t.Status = "נקטע. ימשיך כשהמכשיר יתחבר שוב.";
+                Log.Write($"transfer {t.Name} interrupted: {ex.Message}");
+            }
+            catch (Exception ex) when (t.Attempts < 5 && (ex is OperationCanceledException || LinkErrors.Any(Heb.Of(ex).Contains)))
+            {
+                // Only the Wi-Fi link dropped; Bluetooth is still up. Go on right away from where it stopped.
+                again = true;
+                t.Status = "החיבור התחלף. ממשיך…";
+                Log.Write($"transfer {t.Name} link changed: {ex.Message}");
+            }
+            catch (Exception ex) { t.Status = "שגיאה: " + Heb.Of(ex); Log.Write($"transfer {t.Name}: {ex}"); }
+            finally
+            {
+                if (!again) t.Active = false;
+                _queue.Release();
+            }
+            if (!again) return false;
+        }
+    }
+
+    /// <summary>Interrupted transfers of devices that are connected again continue by themselves.</summary>
+    private void ResumeInterrupted()
+    {
+        foreach (var t in _transfers.Where(t => t.Interrupted && !t.Active).Reverse().ToList())
+        {
+            if (!_b.Sessions.Any(x => x.PeerFp == t.PeerFp)) continue;
+            t.Restart();
+            _ = Run(t);
+        }
+    }
+
+    /// <summary>
+    /// Brings one remote file to <paramref name="local"/>. When it was already opened for viewing (same size and date),
+    /// the local copy is used instead of the network.
+    /// </summary>
+    private Task<bool> QueueDownload(Session s, RemoteItem i, string local)
+    {
+        Transfer t = null!;
+        t = new Transfer
+        {
+            Name = i.Name, LocalPath = local, PeerFp = s.PeerFp,
+            Work = async (ss, ct) =>
+            {
+                if (ViewCache.Find(ss.PeerFp, i) is { } cached && !string.Equals(cached, local, StringComparison.OrdinalIgnoreCase))
+                {
+                    t.LinkKind = "מהעותק שכבר נפתח";
+                    t.Total = i.Size;
+                    Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+                    await Task.Run(() => File.Copy(cached, local, true), ct);
+                    t.SetDone(i.Size);
+                    return;
+                }
+                await RemoteFs.DownloadAsync(ss, i.Path, local, t, ct, i.Size, i.Mtime);
+            },
+        };
+        return Queue(t);
     }
 
     private Task<bool> QueueUpload(Session s, string local, string remote)
     {
-        var t = new Transfer { Name = Path.GetFileName(local), Upload = true, LocalPath = local };
-        return Queue(t, ct => RemoteFs.UploadAsync(s, local, remote, t, ct));
+        Transfer t = null!;
+        t = new Transfer
+        {
+            Name = Path.GetFileName(local), Upload = true, LocalPath = local, PeerFp = s.PeerFp,
+            Work = (ss, ct) => RemoteFs.UploadAsync(ss, local, remote, t, ct),
+        };
+        return Queue(t);
     }
 
     private async void Download_Click(object sender, RoutedEventArgs e)
@@ -601,7 +764,7 @@ public partial class MainWindow : Window
             foreach (var i in sel)
             {
                 if (i.IsDir) await CollectFolderDownload(s, i, root, jobs);
-                else jobs.Add(QueueDownload(s, i.Path, FileService.UniquePath(Path.Combine(root, i.Name)), i.Name));
+                else jobs.Add(QueueDownload(s, i, FileService.UniquePath(Path.Combine(root, i.Name))));
             }
         }
         catch (Exception ex) { Err(ex); }
@@ -616,7 +779,7 @@ public partial class MainWindow : Window
         foreach (var i in listing.Items)
         {
             if (i.IsDir) await CollectFolderDownload(s, i, local, jobs);
-            else jobs.Add(QueueDownload(s, i.Path, Path.Combine(local, i.Name), i.Name));
+            else jobs.Add(QueueDownload(s, i, Path.Combine(local, i.Name)));
         }
     }
 
@@ -740,5 +903,19 @@ public partial class MainWindow : Window
     private void TransferCopy_Click(object sender, RoutedEventArgs e)
     {
         if (SelectedTransfer?.LocalPath is { } p) Clipboard.SetText(p);
+    }
+
+    /// <summary>"Continue": an interrupted or failed transfer tries again from where it stopped.</summary>
+    private void TransferResume_Click(object sender, RoutedEventArgs e)
+    {
+        var t = (sender as FrameworkElement)?.DataContext as Transfer ?? SelectedTransfer;
+        if (t is not { CanResume: true }) return;
+        t.Restart();
+        _ = Run(t);
+    }
+
+    private void TransferList_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        MenuResume.IsEnabled = SelectedTransfer?.CanResume == true;
     }
 }

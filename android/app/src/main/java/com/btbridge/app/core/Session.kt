@@ -32,6 +32,10 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     val peerOs = hr.peerOs
     val peerFp = hr.peerFp
     val linkKey = hr.linkKey
+    /** The other side's program version ("0.3.0") and optional features. */
+    val peerApp = hr.peerApp
+    val peerCaps = hr.peerCaps
+    fun has(cap: String) = cap in peerCaps
     @Volatile var closed = false
         private set
 
@@ -39,8 +43,13 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     @Volatile var peerIps: List<String> = emptyList()
     @Volatile var peerPort = 0
 
+    /** Wi-Fi link ids already accepted on this session: a recorded hello can't be replayed (PROTOCOL.md section 6). */
+    val usedLinkIds: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+
     var onChanged: ((Session) -> Unit)? = null
     var onClosed: ((Session) -> Unit)? = null
+    /** The Wi-Fi link dropped while Bluetooth is still up. */
+    var onWifiLost: ((Session) -> Unit)? = null
 
     private val gate = Any()
     private var bt: Link? = null
@@ -90,13 +99,18 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     }
 
     private fun linkClosed(link: Link) {
+        var wifiLost = false
         val dead = synchronized(gate) {
             if (bt === link) bt = null
-            if (wifi === link) wifi = null
+            if (wifi === link) { wifi = null; wifiLost = true }
             bt == null && wifi == null
         }
         for ((id, e) in sinks) if (dead || (e.sticky && e.link === link)) sinks.remove(id)?.sink?.onFail("החיבור נותק")
-        if (dead) close() else onChanged?.invoke(this)
+        if (dead) close()
+        else {
+            onChanged?.invoke(this)
+            if (wifiLost) onWifiLost?.invoke(this)
+        }
     }
 
     fun close() {

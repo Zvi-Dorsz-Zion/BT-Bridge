@@ -221,9 +221,11 @@ class BridgeAccessibility : AccessibilityService() {
             private set
 
         fun isEnabled(ctx: Context): Boolean {
+            if (instance != null) return true
             val list = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
-            val me = ComponentName(ctx, BridgeAccessibility::class.java).flattenToString()
-            return list.split(':').any { it.equals(me, ignoreCase = true) }
+            // The system may store either "pkg/pkg.Class" or the short "pkg/.Class": compare the parsed names.
+            val me = ComponentName(ctx, BridgeAccessibility::class.java)
+            return list.split(':').any { ComponentName.unflattenFromString(it.trim()) == me }
         }
     }
 

@@ -84,17 +84,34 @@ class WifiLinks(
         }
     }
 
+    /**
+     * Brings a dropped Wi-Fi link back. Only the side that opened Bluetooth connects, so the two sides never race
+     * each other into two links; the other side just announces itself, which makes the opener try.
+     */
+    fun refresh(s: Session) {
+        announce(s)
+        if (s.initiator && !s.hasWifi) pool.execute { tryConnect(s, notifyFail = true) }
+    }
+
+    /** After joining a new network: try the other side's addresses right away, whichever side we are. */
+    fun kick(s: Session) {
+        announce(s)
+        if (!s.hasWifi) pool.execute { tryConnect(s, notifyFail = true) }
+    }
+
     private fun linkHandshake(s: Session, sock: Socket): Boolean = try {
         sock.tcpNoDelay = true
         sock.soTimeout = 5000
         val linkId = Crypto.random(16)
         Wire.write(sock.getOutputStream(), concat(linkId, hmac(s.linkKey, utf8("btb-wifi"), linkId)))
-        if (!same(Wire.read(sock.getInputStream()), hmac(s.linkKey, utf8("btb-wifi-ok"), linkId)))
+        val r = Wire.read(sock.getInputStream())
+        if (r.size != 48) throw ProtocolException("wifi ack")
+        val srvNonce = r.copyOfRange(0, 16)
+        if (!same(r.copyOfRange(16, 48), hmac(s.linkKey, utf8("btb-wifi-ok"), linkId, srvNonce)))
             throw ProtocolException("wifi ack")
         sock.soTimeout = 0
-        val hex = hex(linkId)
-        s.attach(Link(true, sock.getInputStream(), sock.getOutputStream(), sock,
-            RecordCodec(expand(s.linkKey, "up $hex"), expand(s.linkKey, "down $hex"))))
+        val (up, down) = linkKeys(s.linkKey, linkId, srvNonce)
+        s.attach(Link(true, sock.getInputStream(), sock.getOutputStream(), sock, RecordCodec(up, down)))
         true
     } catch (e: Exception) {
         Log.w("wifi handshake: ${e.message}")
@@ -118,11 +135,12 @@ class WifiLinks(
             val mac = f.copyOfRange(16, 48)
             val s = sessions().firstOrNull { same(mac, hmac(it.linkKey, utf8("btb-wifi"), linkId)) }
                 ?: throw ProtocolException("unknown wifi link")
-            Wire.write(c.getOutputStream(), hmac(s.linkKey, utf8("btb-wifi-ok"), linkId))
+            if (!s.usedLinkIds.add(hex(linkId))) throw ProtocolException("wifi link id replayed")
+            val srvNonce = Crypto.random(16)
+            Wire.write(c.getOutputStream(), concat(srvNonce, hmac(s.linkKey, utf8("btb-wifi-ok"), linkId, srvNonce)))
             c.soTimeout = 0
-            val hex = hex(linkId)
-            s.attach(Link(true, c.getInputStream(), c.getOutputStream(), c,
-                RecordCodec(expand(s.linkKey, "down $hex"), expand(s.linkKey, "up $hex"))))
+            val (up, down) = linkKeys(s.linkKey, linkId, srvNonce)
+            s.attach(Link(true, c.getInputStream(), c.getOutputStream(), c, RecordCodec(down, up)))
         } catch (e: Exception) {
             Log.w("wifi accept: ${e.message}")
             runCatching { c.close() }
@@ -131,6 +149,15 @@ class WifiLinks(
 
     companion object {
         fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+        /**
+         * PROTOCOL.md section 6. Both sides add fresh randomness to the link keys, and the accepting side refuses a link id
+         * it has seen, so a recorded hello can neither take over the link nor make us reuse an AES-GCM nonce.
+         */
+        fun linkKeys(linkKey: ByteArray, linkId: ByteArray, srvNonce: ByteArray): Pair<ByteArray, ByteArray> {
+            val tag = hex(linkId) + hex(srvNonce)
+            return expand(linkKey, "up $tag") to expand(linkKey, "down $tag")
+        }
 
         /** Plain TCP connect, for JVM tests and as a fallback. */
         fun plainConnect(ip: String, port: Int, timeoutMs: Int): Socket =

@@ -9,6 +9,7 @@ import com.btbridge.app.core.Crypto.sha256
 import com.btbridge.app.core.Crypto.u32
 import com.btbridge.app.core.Crypto.unb64
 import com.btbridge.app.core.Crypto.utf8
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
@@ -48,9 +49,27 @@ fun interface AskPassword {
 class HandshakeResult(
     val codec: RecordCodec, val linkKey: ByteArray,
     val peerName: String, val peerOs: String, val peerFp: String, val peerPub: ByteArray,
+    val peerApp: String, val peerCaps: Set<String>,
 )
 
 class AuthException(val code: String, message: String) : ProtocolException(message)
+
+/** This app's version, sent to the other side. The app sets it at start; tests leave the default. */
+object AppInfo {
+    @Volatile var version = "0"
+
+    /** -1, 0 or 1, comparing "1.2.3" strings; anything unreadable counts as oldest. */
+    fun compare(a: String, b: String): Int {
+        fun parts(s: String) = s.split('.').map { it.toIntOrNull() ?: 0 }
+        val x = parts(a)
+        val y = parts(b)
+        for (i in 0 until maxOf(x.size, y.size)) {
+            val d = (x.getOrElse(i) { 0 }).compareTo(y.getOrElse(i) { 0 })
+            if (d != 0) return d
+        }
+        return 0
+    }
+}
 
 /** 5 wrong passwords in a row lock password attempts for 5 minutes. */
 class Lockout {
@@ -67,14 +86,19 @@ class Lockout {
 
 /** PROTOCOL.md section 2. */
 object Handshake {
-    const val VERSION = 1
+    const val VERSION = 2
+
+    /** Optional features this side understands (PROTOCOL.md section 2, "caps"). */
+    val CAPS = listOf("clip", "notif", "resume", "ring", "battery", "update", "log")
+
+    /** PBKDF2 rounds a peer may ask for: fewer would make a captured proof easy to crack, more would freeze us. */
+    const val MIN_ITER = 10_000
+    const val MAX_ITER = 5_000_000
 
     fun client(input: InputStream, out: OutputStream, me: Identity, st: Store, os: String,
                peerAddress: String, ask: AskPassword): HandshakeResult {
-        val known = st.findByAddress(peerAddress)
         val eph = Crypto.newKeyPair()
-        val hello = hello(me, st, eph, os).put("needPw", known == null)
-        val c = utf8(hello.toString())
+        val c = utf8(hello(me, st, eph, os).toString())
         Wire.write(out, c)
 
         val s = Wire.read(input)
@@ -83,21 +107,31 @@ object Handshake {
         val fp = Crypto.fingerprint(peerPub)
         val peerName = sh.str("name") ?: "?"
         val peerOs = sh.str("os") ?: ""
-        if (known != null && known.fp != fp)
+
+        // Trust is by key. The Bluetooth address only catches a reinstalled device, to explain the password prompt.
+        val known = st.findByFp(fp)
+        val byAddress = st.findByAddress(peerAddress)
+        if (known == null && byAddress != null)
             throw AuthException("keychanged",
-                "המפתח של \"${known.name}\" השתנה מאז הפעם הקודמת. אם התקנת אותו מחדש, בחר \"שכח מכשיר\" ונסה שוב.")
+                "המפתח של \"${byAddress.name}\" השתנה מאז הפעם הקודמת. אם התקנת אותו מחדש, בחר \"שכח מכשיר\" ונסה שוב.")
 
         val (codec, linkKey, th) = derive(eph, unb64(sh.getString("eph")), c, s, client = true)
-        val pwInfo = sh.obj("pw")
-        if (pwInfo?.bool("set") == false)
+        val pwInfo = sh.obj("pw") ?: throw ProtocolException("הודעת פתיחה לא תקינה")
+        val trustsMe = sh.bool("trusted") == true
+        val needPw = !(trustsMe && known != null)
+        Log.w("handshake with $peerName ($peerAddress): they trust us=$trustsMe, we trust them=${known != null}")
+        if (needPw && pwInfo.bool("set") == false)
             throw AuthException("nopassword", "ב-\"$peerName\" עוד לא נקבעה סיסמה. קבע סיסמה שם ונסה שוב.")
+        val iter = pwInfo.optInt("iter")
+        if (needPw && iter !in MIN_ITER..MAX_ITER) throw ProtocolException("הגדרות הסיסמה במכשיר השני לא תקינות")
+
         var wrong = false
         repeat(3) {
             var key: ByteArray? = null
             var remember = false
-            if (pwInfo != null) {
+            if (needPw) {
                 val a = ask.ask(peerName, wrong) ?: throw CancellationException("בוטל")
-                key = Crypto.pbkdf2(a.password, unb64(pwInfo.getString("salt")), pwInfo.getInt("iter"))
+                key = Crypto.pbkdf2(a.password, unb64(pwInfo.getString("salt")), iter)
                 remember = a.remember
             }
             val auth = JSONObject()
@@ -118,13 +152,11 @@ object Handshake {
                     if (!same(proof, hmac(key, utf8("btb-pw-s"), th)))
                         throw AuthException("sig", "המכשיר השני לא הוכיח שהוא יודע את הסיסמה")
                     if (remember) st.trust(fp, peerPub, peerName, peerAddress, peerOs)
-                } else if (known == null) {
-                    throw AuthException("sig", "המכשיר השני לא ביקש סיסמה, אבל הוא לא מוכר כאן")
                 } else st.touch(fp, peerName, peerAddress)
-                return HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub)
+                return result(codec, linkKey, peerName, peerOs, fp, peerPub, sh)
             }
             val err = res.str("err") ?: ""
-            if (err == "password" && pwInfo != null) { wrong = true; return@repeat }
+            if (err == "password" && needPw) { wrong = true; return@repeat }
             throw AuthException(err, when (err) {
                 "password" -> "סיסמה שגויה"
                 "locked" -> "יותר מדי ניסיונות שגויים. נסה שוב בעוד 5 דקות."
@@ -143,14 +175,16 @@ object Handshake {
         val fp = Crypto.fingerprint(peerPub)
         val peerName = ch.str("name") ?: "?"
         val peerOs = ch.str("os") ?: ""
-        val trusted = st.findByFp(fp) != null && ch.bool("needPw") != true
+        val trusted = st.findByFp(fp) != null
 
         val eph = Crypto.newKeyPair()
+        // The password details always go out: the client may not trust us even when we trust it.
         val hello = hello(me, st, eph, os)
-        hello.put("pw", if (trusted) JSONObject.NULL else JSONObject()
-            .put("salt", if (st.hasPassword) st.pwSalt else b64(Crypto.random(16)))
-            .put("iter", st.pwIter)
-            .put("set", st.hasPassword))
+            .put("pw", JSONObject()
+                .put("salt", if (st.hasPassword) st.pwSalt else b64(Crypto.random(16)))
+                .put("iter", st.pwIter)
+                .put("set", st.hasPassword))
+            .put("trusted", trusted)
         val s = utf8(hello.toString())
         Wire.write(out, s)
 
@@ -163,21 +197,25 @@ object Handshake {
             if (!Crypto.verify(peerPub, concat(utf8("btb-c"), th), unb64(auth.getString("sig"))))
                 fail(out, codec, "sig")
 
-            if (trusted) {
+            val proof = auth.str("pw")?.let { unb64(it) }
+            if (proof == null) {
+                if (!trusted) fail(out, codec, "password")
                 st.touch(fp, peerName, peerAddress)
                 ok(out, codec, me, th, null)
-                return HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub)
+                Log.w("handshake with $peerName ($peerAddress): trusted both ways")
+                return result(codec, linkKey, peerName, peerOs, fp, peerPub, ch)
             }
             if (!st.hasPassword) fail(out, codec, "nopassword")
             if (lockout.locked) fail(out, codec, "locked")
 
             val key = st.passwordKey()
-            val proof = auth.str("pw")?.let { unb64(it) }
             if (same(proof, hmac(key, utf8("btb-pw-c"), th))) {
                 lockout.reset()
-                if (auth.bool("remember") == true) st.trust(fp, peerPub, peerName, peerAddress, peerOs)
+                val remember = auth.bool("remember") == true
+                if (remember) st.trust(fp, peerPub, peerName, peerAddress, peerOs)
                 ok(out, codec, me, th, hmac(key, utf8("btb-pw-s"), th))
-                return HandshakeResult(codec, linkKey, peerName, peerOs, fp, peerPub)
+                Log.w("handshake with $peerName ($peerAddress): password ok, remember=$remember, we trusted them before=$trusted")
+                return result(codec, linkKey, peerName, peerOs, fp, peerPub, ch)
             }
             lockout.fail()
             Log.w("wrong password from $peerName ($peerAddress)")
@@ -192,13 +230,22 @@ object Handshake {
         .put("v", VERSION)
         .put("name", st.deviceName)
         .put("os", os)
+        .put("app", AppInfo.version)
+        .put("caps", JSONArray(CAPS))
         .put("id", b64(me.public))
         .put("eph", b64(Crypto.publicBytes(eph.public as ECPublicKey)))
         .put("nonce", b64(Crypto.random(32)))
 
+    private fun result(codec: RecordCodec, linkKey: ByteArray, name: String, os: String, fp: String, pub: ByteArray, hello: JSONObject): HandshakeResult {
+        val arr = hello.optJSONArray("caps")
+        val caps = if (arr == null) emptySet() else (0 until arr.length()).map { arr.optString(it) }.toSet()
+        return HandshakeResult(codec, linkKey, name, os, fp, pub, hello.str("app") ?: "", caps)
+    }
+
     private fun parseHello(b: ByteArray): JSONObject {
         val o = try { JSONObject(String(b, Charsets.UTF_8)) } catch (e: Exception) { throw ProtocolException("הודעת פתיחה לא תקינה") }
-        if (o.optInt("v") != VERSION) throw ProtocolException("גרסת הפרוטוקול במכשיר השני שונה. עדכן את שני הצדדים.")
+        if (o.optInt("v") != VERSION)
+            throw ProtocolException("גרסת הפרוטוקול במכשיר השני שונה. עדכן את שני הצדדים לאותה גרסה של גשר בלוטוס.")
         return o
     }
 
@@ -232,4 +279,7 @@ object Handshake {
 object Log {
     @Volatile var sink: (String) -> Unit = { println(it) }
     fun w(msg: String) = try { sink(msg) } catch (_: Exception) { }
+
+    /** The end of the log, for the other device's "show log" (Android sets it to read its log file). */
+    @Volatile var tail: (Int) -> String = { "" }
 }

@@ -34,6 +34,11 @@ class AndroidStore(val ctx: Context) : Store {
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "גשר בלוטוס")
         else File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "גשר בלוטוס")
 
+    /** Where "download" saves, in words for the user. */
+    val downloadLabel: String
+        get() = if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "הורדות ← גשר בלוטוס"
+        else "התיקייה הפנימית של האפליקציה"
+
     /** Files opened only for viewing are deleted after this many hours. */
     var viewCleanupHours: Int
         get() = prefs.getInt("viewCleanupHours", 1)
@@ -46,6 +51,24 @@ class AndroidStore(val ctx: Context) : Store {
     var allowControl: Boolean
         get() = prefs.getBoolean("allowControl", true)
         set(v) { prefs.edit().putBoolean("allowControl", v).apply(); version.value++ }
+
+    /** Text copied here can be pasted on the computer, and the other way. */
+    var shareClipboard: Boolean
+        get() = prefs.getBoolean("shareClipboard", true)
+        set(v) { prefs.edit().putBoolean("shareClipboard", v).apply(); version.value++ }
+
+    /** Notifications that appear on the phone also show up on the computer (needs "notification access"). */
+    var forwardNotifications: Boolean
+        get() = prefs.getBoolean("forwardNotifications", true)
+        set(v) { prefs.edit().putBoolean("forwardNotifications", v).apply(); version.value++ }
+
+    /** Optional permissions the user chose not to be reminded about on the home screen. */
+    var dismissedPermissions: Set<String>
+        get() = prefs.getStringSet("dismissedPermissions", emptySet()) ?: emptySet()
+        set(v) { prefs.edit().putStringSet("dismissedPermissions", v).apply(); version.value++ }
+
+    /** The saved key could not be read and a new one was made: known devices will ask for the password again. */
+    @Volatile var identityWasReset = false
 
     /** "auto": open a temporary hotspot for the computer when there is no shared network. "off": never. */
     var directMode: String
@@ -136,7 +159,10 @@ class AndroidStore(val ctx: Context) : Store {
                 val priv = kf.generatePrivate(PKCS8EncodedKeySpec(Crypto.unb64(o.getString("priv"))))
                 return Identity(KeyPair(pub, priv))
             } catch (e: Exception) {
+                // Keep the unreadable file and tell the user once.
                 com.btbridge.app.core.Log.w("identity load failed, creating new: ${e.message}")
+                runCatching { f.copyTo(File(ctx.filesDir, "identity.key.bad-${System.currentTimeMillis()}"), overwrite = true) }
+                identityWasReset = true
             }
         }
         val kp = Crypto.newKeyPair()

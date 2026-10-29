@@ -56,6 +56,13 @@ class ShareActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         BridgeService.start(this)
         val uris = sharedUris(intent)
+        // Shared text (not a file): it goes to the computer's clipboard.
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (uris.isEmpty() && !text.isNullOrEmpty()) {
+            android.widget.Toast.makeText(this, ClipSend.send(text), android.widget.Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
         setContent {
             val dark = isSystemInDarkTheme()
             MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = Color(0xFF60A5FA)) else lightColorScheme(primary = Color(0xFF2563EB))) {
@@ -126,9 +133,9 @@ class ShareActivity : ComponentActivity() {
                                         val files = withContext(Dispatchers.IO) { uris.mapNotNull { runCatching { LocalFiles.fromUri(this@ShareActivity, it) }.getOrNull() } }
                                         if (files.sumOf { it.size } > 5L * 1024 * 1024) withContext(Dispatchers.IO) { b.ensureFastLink(s) }
                                         sent = files.map { f ->
-                                            Transfer(f.name, upload = true).also { tr ->
-                                                b.queue(tr, { RemoteFs.upload(s, f.open, f.size, f.mtime, f.name, tr, inbox = true) })
-                                            }
+                                            Transfer(f.name, upload = true, s.peerFp) { ss, tr ->
+                                                RemoteFs.upload(ss, f.open, f.size, f.mtime, f.name, tr, inbox = true)
+                                            }.also { b.queue(it) }
                                         }
                                     } catch (e: Exception) {
                                         error = com.btbridge.app.core.Heb.of(e)

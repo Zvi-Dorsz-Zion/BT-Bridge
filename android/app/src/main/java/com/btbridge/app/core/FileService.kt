@@ -6,20 +6,81 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
-/** Writes an incoming DATA…END stream into a file. */
+/**
+ * Writes an incoming DATA…END stream into a file on its own thread, so a slow disk never holds up the link
+ * (pings, requests and other streams keep flowing). Up to 64 chunks wait in memory; beyond that the link waits.
+ * [whenEnd] and [whenFail] run on the writer thread after everything before them was written and the file was closed.
+ * (Named apart from onEnd/onFail on purpose: a call to those inside this class would reach the methods below, not the callbacks.)
+ */
 class FileSink(
     private val out: FileOutputStream,
     private val progress: ((Int) -> Unit)?,
-    private val onEnd: (JSONObject) -> Unit,
-    private val onFail: (String) -> Unit,
+    private val whenEnd: (JSONObject) -> Unit,
+    private val whenFail: (String) -> Unit,
 ) : StreamSink {
-    override fun onData(buf: ByteArray, off: Int, len: Int) {
-        out.write(buf, off, len)
-        progress?.invoke(len)
+    private val q = java.util.concurrent.ArrayBlockingQueue<Any>(64)
+    @Volatile private var error: Exception? = null
+    @Volatile private var finished = false
+
+    private class EndMark(val end: JSONObject)
+    private class FailMark(val why: String)
+
+    init {
+        // A lambda, not "::run": that name also matches Kotlin's own run {} and the thread would do nothing.
+        Thread({ writeLoop() }, "file-writer").apply { isDaemon = true }.start()
     }
 
-    override fun onEnd(end: JSONObject) = onEnd.invoke(end)
-    override fun onFail(why: String) = onFail.invoke(why)
+    override fun onData(buf: ByteArray, off: Int, len: Int) {
+        error?.let { throw it }
+        put(buf.copyOfRange(off, off + len))
+    }
+
+    override fun onEnd(end: JSONObject) = put(EndMark(end))
+    override fun onFail(why: String) = put(FailMark(why))
+
+    /** After the end or a failure nothing more is accepted (a late record is dropped instead of waiting forever). */
+    private fun put(item: Any) {
+        while (!finished) if (q.offer(item, 200, java.util.concurrent.TimeUnit.MILLISECONDS)) return
+    }
+
+    private fun writeLoop() {
+        try {
+            while (true) {
+                when (val item = q.take()) {
+                    is ByteArray -> if (error == null) {
+                        try { out.write(item); progress?.invoke(item.size) } catch (e: Exception) { error = e }
+                    }
+                    is EndMark -> {
+                        finish()
+                        val err = error
+                        try { if (err != null) whenFail(Heb.of(err)) else whenEnd(item.end) } catch (e: Exception) { Log.w("file sink end: ${e.message}") }
+                        return
+                    }
+                    is FailMark -> {
+                        finish()
+                        try { whenFail(item.why) } catch (e: Exception) { Log.w("file sink fail: ${e.message}") }
+                        return
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            // Never leave the waiting side hanging.
+            Log.w("file writer: $e")
+            finish()
+            runCatching { whenFail("שגיאה בכתיבת הקובץ") }
+        }
+    }
+
+    private fun finish() {
+        finished = true
+        q.clear()
+        try { out.close() } catch (e: Exception) { if (error == null) error = e }
+    }
+
+    companion object {
+        /** A failure the user asked for (cancel). Anything else (a dropped connection) keeps the partial file for resuming. */
+        fun isCancel(why: String) = why.startsWith("בוטל")
+    }
 }
 
 class Root(val name: String, val dir: File, val total: Long = 0, val free: Long = 0)
@@ -34,7 +95,8 @@ class FileService(
     private val home: File,
     private val roots: () -> List<Root>,
     private val inboxDir: () -> File = { home },
-    private val onReceived: ((Session, File) -> Unit)? = null,
+    /** A file arrived through "send to device"; the flag says it is an update of this app (PROTOCOL.md section 4). */
+    private val onReceived: ((Session, File, Boolean) -> Unit)? = null,
 ) {
     fun handle(s: Session, id: Int, req: JSONObject): JSONObject? = when (val op = req.str("op")) {
         "info" -> JSONObject().put("name", deviceName()).put("os", os).put("sep", "/").put("home", home.path)
@@ -126,29 +188,31 @@ class FileService(
         if (target.isDirectory) throw RemoteException("exists", "קיימת תיקייה בשם הזה: ${target.path}")
         target.parentFile?.mkdirs()
         val part = File(target.path + ".btpart")
-        val out = FileOutputStream(part)
+        // Resume (PROTOCOL.md section 4): the target name is chosen the same way again, so an interrupted
+        // upload finds its own partial file and only the rest is sent.
+        val resume = req.bool("resume") == true && part.isFile
+        val have = if (resume) part.length() else 0L
+        val out = FileOutputStream(part, resume)
         val mtime = req.long("mtime")
         val finalTarget = target
         s.expectStream(id, FileSink(out, null,
-            onEnd = {
+            whenEnd = {
                 try {
-                    out.close()
                     if (overwrite) finalTarget.delete()
                     if (!part.renameTo(finalTarget)) throw RemoteException("io", "שמירת הקובץ נכשלה")
                     if (mtime > 0) finalTarget.setLastModified(mtime)
                     s.sendDone(id, JSONObject().put("ok", true).put("path", finalTarget.path))
-                    if (inbox) onReceived?.invoke(s, finalTarget)
+                    if (inbox) onReceived?.invoke(s, finalTarget, req.bool("update") == true)
                 } catch (e: Exception) {
                     part.delete()
                     runCatching { s.sendDone(id, JSONObject().put("err", "io").put("msg", Heb.of(e))) }
                 }
             },
-            onFail = { why ->
-                runCatching { out.close() }
-                part.delete()
+            whenFail = { why ->
+                if (FileSink.isCancel(why)) part.delete()
                 runCatching { s.sendDone(id, JSONObject().put("err", "cancelled").put("msg", why)) }
             }))
-        return ok().put("path", target.path)
+        return ok().put("path", target.path).put("have", have)
     }
 
     companion object {

@@ -34,6 +34,7 @@ if (!bridge.Settings.HasPassword) bridge.Settings.SetPassword(Password);
 bridge.Grabber = () => new FakeGrabber();
 bridge.Input = new PrintInput();
 bridge.Received += (_, p) => Console.WriteLine("RECEIVED " + p);
+bridge.ClipboardReceived += (_, text) => Console.WriteLine("CLIP " + text);
 bridge.Wifi.Start();
 
 if (mode == "server")
@@ -48,12 +49,31 @@ if (mode == "server")
             var c = await l.AcceptTcpClientAsync();
             _ = Task.Run(() =>
             {
-                try { var s = bridge.Serve(c.GetStream(), c, "AABBCCDDEE01"); Console.WriteLine("SESSION " + s.PeerName); }
+                try
+                {
+                    var s = bridge.Serve(c.GetStream(), c, "AABBCCDDEE01");
+                    Console.WriteLine($"SESSION {s.PeerName} app={s.PeerApp} clip={s.Has("clip")}");
+                }
                 catch (Exception ex) { Console.WriteLine("SERVE-FAIL " + ex.Message); c.Dispose(); }
             });
         }
     });
-    Console.In.ReadToEnd();
+    // Commands from the Kotlin test, one per line, until stdin closes.
+    string? line;
+    while ((line = Console.ReadLine()) != null)
+    {
+        if (line == "FORGET")
+        {
+            foreach (var t in bridge.Settings.Trusted.ToList()) bridge.Settings.Forget(t.Fp);
+            Console.WriteLine("FORGOT");
+        }
+        else if (line.StartsWith("CLIP "))
+        {
+            bridge.Settings.ShareClipboard = true;
+            bridge.ShareClipboard(line[5..]);
+            Console.WriteLine("CLIP-SENT");
+        }
+    }
     return 0;
 }
 
@@ -73,8 +93,18 @@ try
     var s = Connect();
     if (asked != 2) throw new Exception("expected a wrong password first, then the right one; asked=" + asked);
     Check(s.PeerName == "טלפון-בדיקה", "peer name " + s.PeerName);
+    Check(s.PeerApp == "9.9.9" && s.Has("resume") && s.Has("clip"), $"version and caps: {s.PeerApp} {string.Join(",", s.PeerCaps)}");
     for (int i = 0; i < 50 && !s.HasWifi; i++) Thread.Sleep(100);
     Console.WriteLine("WIFI " + s.HasWifi);
+
+    // A recorded Wi-Fi hello must not be accepted twice (PROTOCOL.md section 6).
+    Check(ReplayRefused(s), "wifi hello replay accepted");
+    for (int i = 0; i < 80 && !s.HasWifi; i++) Thread.Sleep(100);
+    Check(s.HasWifi, "wifi link came back after the replay test");
+    Console.WriteLine("REPLAY refused");
+
+    // Shared clipboard, both ways.
+    s.SendEvent(new System.Text.Json.Nodes.JsonObject { ["ev"] = "clip", ["text"] = "מהמחשב" });
 
     var listing = await RemoteFs.ListAsync(s, remoteDir);
     Check(listing.Items.Any(x => x.Name == "from-kotlin.bin" && x.Size == 3_000_000), "list");
@@ -83,6 +113,17 @@ try
     var t = new Transfer { Name = "got.bin" };
     await RemoteFs.DownloadAsync(s, RemoteFs.Join(s, remoteDir, "from-kotlin.bin"), local, t, default);
     Check(Pattern.Same(File.ReadAllBytes(local), 3_000_000), "download content");
+
+    // Resume: half of the file is already here from an interrupted try; only the rest comes.
+    var item = listing.Items.First(x => x.Name == "from-kotlin.bin");
+    var resumed = Path.Combine(Log.Dir, "resumed.bin");
+    File.WriteAllBytes(resumed + ".btpart", Pattern.Make(3_000_000)[..1_200_000]);
+    var tr = new Transfer { Name = "resumed.bin", Attempts = 1 };
+    long sent = 0;
+    await RemoteFs.DownloadAsync(s, item.Path, resumed, tr, default, item.Size, item.Mtime);
+    sent = tr.Done;
+    Check(Pattern.Same(File.ReadAllBytes(resumed), 3_000_000), "resumed download content");
+    Console.WriteLine("RESUME-DOWNLOAD ok");
 
     var up = Path.Combine(Log.Dir, "up.bin");
     File.WriteAllBytes(up, Pattern.Make(2_500_000));
@@ -131,6 +172,10 @@ try
     await Task.Delay(500);
     sc.Close();
 
+    // The log of the other side, for troubleshooting.
+    var log = await s.RequestAsync(new System.Text.Json.Nodes.JsonObject { ["op"] = "log" });
+    Check(log["text"] != null, "log");
+
     // Second connection: both sides remember each other, so no password this time.
     s.Close();
     Thread.Sleep(300);
@@ -141,8 +186,42 @@ try
     var again = await RemoteFs.ListAsync(s2, remoteDir);
     Check(again.Items.Any(x => x.Name == "from-windows.bin"), "list after reconnect");
     s2.Close();
+    Thread.Sleep(300);
+
+    // Only this side forgot the other (say, after reinstalling): the password is asked once, and both trust each other again.
+    foreach (var tt in bridge.Settings.Trusted.ToList()) bridge.Settings.Forget(tt.Fp);
+    asked = 0;
+    bridge.AskPassword = (_, _) => { asked++; return new PasswordAnswer(Password, true); };
+    var s3 = Connect();
+    Check(asked == 1, "one-sided trust should ask once; asked=" + asked);
+    s3.Close();
+    Thread.Sleep(300);
+    asked = 0;
+    var s4 = Connect();
+    Check(asked == 0, "password asked again after trust was restored");
+    s4.Close();
     Console.WriteLine("OK");
     return 0;
+
+    // Opens a raw TCP connection to the phone's Wi-Fi port twice with the same hello: the first is answered, the second refused.
+    bool ReplayRefused(Session ss)
+    {
+        var linkId = BtBridge.Core.Crypto.Random(16);
+        var hello = BtBridge.Core.Crypto.Concat(linkId, BtBridge.Core.Crypto.Hmac(ss.LinkKey, BtBridge.Core.Crypto.Utf8("btb-wifi"), linkId));
+        byte[]? Try()
+        {
+            using var c = new TcpClient();
+            c.Connect(IPAddress.Parse(ss.PeerIps[0]), ss.PeerPort);
+            var st = c.GetStream();
+            st.ReadTimeout = 3000;
+            Wire.Write(st, hello);
+            try { return Wire.Read(st); } catch { return null; }
+        }
+        var first = Try();
+        var second = Try();
+        Console.WriteLine($"REPLAY first={first?.Length} second={second?.Length}");
+        return first?.Length == 48 && second == null;
+    }
 
     Session Connect()
     {

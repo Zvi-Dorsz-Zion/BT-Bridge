@@ -163,7 +163,7 @@ public partial class PhoneScreenWindow : Window
 
     private void Profile_Changed(object sender, SelectionChangedEventArgs e)
     {
-        // Also fires while the window loads, before the stream exists.
-        if (ProfileBox.SelectedItem is ComboBoxItem { Tag: string p } && _sc is { Id: not 0 }) _sc.Configure(profile: p, key: true);
+        // Also fires while the window loads, before the stream (and even the named controls) exist.
+        if (sender is ComboBox { SelectedItem: ComboBoxItem { Tag: string p } } && _sc is { Id: not 0 }) _sc.Configure(profile: p, key: true);
     }
 }

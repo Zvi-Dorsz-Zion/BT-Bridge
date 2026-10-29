@@ -162,6 +162,8 @@ public sealed class SettingsWindow : DialogBase
         Content = "רשת ישירה: כשאין רשת משותפת, להתחבר לנקודה חמה זמנית של הטלפון (להעברות גדולות ולשליטה)",
         Margin = new Thickness(0, 6, 0, 0),
     };
+    private readonly CheckBox _clip = new() { Content = "לוח הדבקה משותף: טקסט שמעתיקים באחד המכשירים אפשר להדביק בשני", Margin = new Thickness(0, 6, 0, 0) };
+    private readonly CheckBox _notif = new() { Content = "להציג ליד השעון התראות שמופיעות בטלפון", Margin = new Thickness(0, 6, 0, 0) };
     private readonly ListBox _trusted = new() { Height = 120, DisplayMemberPath = "Label" };
 
     private sealed record TrustedRow(string Fp, string Label);
@@ -210,6 +212,10 @@ public sealed class SettingsWindow : DialogBase
         _direct.IsChecked = st.DirectMode != "off";
         ((CheckBox)_direct).Content = new TextBlock { Text = (string)_direct.Content, TextWrapping = TextWrapping.Wrap };
         Body.Children.Add(_direct);
+        _clip.IsChecked = st.ShareClipboard;
+        Body.Children.Add(_clip);
+        _notif.IsChecked = st.ShowPhoneNotifications;
+        Body.Children.Add(_notif);
         Body.Children.Add(new TextBlock
         {
             Text = "מצב \"בלי להפריע\" (שלב 3): כדי שהטלפון יעבוד על מסך משלו, הוסף למחשב מסך וירטואלי " +
@@ -234,6 +240,7 @@ public sealed class SettingsWindow : DialogBase
         };
         Body.Children.Add(forget);
         Body.Children.Add(Text($"טביעת האצבע של המחשב הזה: {Crypto.FingerprintDigits(App.Core.Me.Fp)}", top: 10));
+        Body.Children.Add(Text($"גרסה {AppInfo.Version}"));
         Body.Children.Add(Error);
         LoadTrusted();
     }
@@ -253,6 +260,8 @@ public sealed class SettingsWindow : DialogBase
         st.AutoReconnect = _reconnect.IsChecked == true;
         st.AllowControl = _control.IsChecked == true;
         st.DirectMode = _direct.IsChecked == true ? "auto" : "off";
+        st.ShareClipboard = _clip.IsChecked == true;
+        st.ShowPhoneNotifications = _notif.IsChecked == true;
         st.Save();
         if (!st.AllowControl) ScreenSource.StopAll();
         try { Startup.Enabled = _startup.IsChecked == true; }

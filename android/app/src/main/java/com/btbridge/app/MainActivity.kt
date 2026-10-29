@@ -115,6 +115,16 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed.intValue++
+        // Opening the app stops "ring the phone".
+        Ring.stop(this)
+    }
+
+    /** Android lets the app read the clipboard only while it has focus: send what was copied to the computer now. */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus || !App.bridge.store.shareClipboard) return
+        val text = ClipSend.current(this) ?: return
+        App.bridge.runInBackground { App.bridge.shareClipboard(text) }
     }
 }
 
@@ -263,9 +273,10 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
         HorizontalDivider()
     }
 
-    val missingOptional = !BridgeAccessibility.isEnabled(ctx) ||
-        (b.store.directMode != "off" && !nearbyGranted(ctx)) ||
-        !ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)
+    // Optional permissions that are missing, by name. The user can hide the reminder; it comes back only for a new one.
+    val missing = remember(resumed, storeVersion) { missingOptional(ctx) }
+    val showMissing = missing.isNotEmpty() && !b.store.dismissedPermissions.containsAll(missing)
+    var identityNotice by remember { mutableStateOf(b.store.identityWasReset) }
 
     Scaffold(topBar = {
         TopAppBar(title = { Text("גשר בלוטוס") }, actions = {
@@ -286,8 +297,9 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
                     ctx.startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + ctx.packageName)))
                 }
             }
-            if (missingOptional) item {
-                Notice("יש הרשאות שעוד לא אושרו (שליטה מהמחשב, רשת ישירה, פעולה ברקע).", "פרטים", onSettings)
+            if (showMissing) item {
+                Notice("עוד לא אושר: ${missing.joinToString(", ")}.", "פרטים", secondary = "אל תזכיר",
+                    onSecondary = { b.store.dismissedPermissions = missing.toSet() }, onClick = onSettings)
             }
             item { Text(if (mine.isEmpty()) "עוד לא התחברת לאף מכשיר" else "המכשירים שלי", Modifier.padding(16.dp, 12.dp, 16.dp, 4.dp), fontWeight = FontWeight.SemiBold) }
             items(mine, key = { "m" + it.key }) { DeviceRowItem(it) }
@@ -347,16 +359,34 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
         )
     }
     message?.let { MessageDialog(it) { message = null } }
+    if (identityNotice) MessageDialog("המפתח של הטלפון לא נטען, ולכן נוצר מפתח חדש. המכשירים המוכרים יבקשו את הסיסמה פעם אחת.") {
+        identityNotice = false
+        b.store.identityWasReset = false
+    }
+}
+
+/** Optional permissions that are missing, in words for the user. */
+private fun missingOptional(ctx: Context): List<String> {
+    val b = App.bridge
+    val out = mutableListOf<String>()
+    if (!BridgeAccessibility.isEnabled(ctx)) out += "שליטה מהמחשב"
+    if (b.store.directMode != "off" && !nearbyGranted(ctx)) out += "מיקום (לרשת ישירה)"
+    if (!ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) out += "פעולה ברקע"
+    if (b.store.forwardNotifications && !BridgeNotifications.isEnabled(ctx)) out += "התראות הטלפון במחשב"
+    return out
 }
 
 @Composable
-private fun Notice(text: String, action: String, onClick: () -> Unit) {
+private fun Notice(text: String, action: String, secondary: String? = null, onSecondary: () -> Unit = {}, onClick: () -> Unit) {
     Card(Modifier.fillMaxWidth().padding(16.dp, 6.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(text, Modifier.weight(1f))
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onClick) { Text(action) }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Button(onClick = onClick) { Text(action) }
+                if (secondary != null) TextButton(onClick = onSecondary) { Text(secondary) }
+            }
         }
     }
 }
@@ -553,6 +583,7 @@ fun TransferRow(t: Transfer) {
             Spacer(Modifier.width(8.dp))
             Text(t.name, Modifier.weight(1f), maxLines = 1, fontWeight = FontWeight.SemiBold)
             if (t.active) TextButton(onClick = { t.cancel.cancel() }) { Text("בטל") }
+            else if (t.canResume) TextButton(onClick = { App.bridge.resume(t) }) { Text("המשך") }
             else if (!t.upload && t.resultPath != null && !t.status.startsWith("שגיאה") && t.status != "בוטל") {
                 TextButton(onClick = { LocalFiles.open(ctx, java.io.File(t.resultPath!!)) }) { Text("פתח") }
             }
@@ -564,7 +595,24 @@ fun TransferRow(t: Transfer) {
                 (if (t.linkKind.isNotEmpty()) " · ${t.linkKind}" else "") + " · ${t.status}",
             style = MaterialTheme.typography.bodySmall,
         )
+        // Where a downloaded file landed, so it can be found in the phone's file manager too.
+        val saved = t.resultPath
+        if (!t.upload && !t.active && saved != null && !saved.startsWith(ctx.cacheDir.path))
+            Text("נשמר ב: ${friendlyPath(saved)}", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
     }
+}
+
+/** "/storage/emulated/0/Download/גשר בלוטוס/a.jpg" → "זיכרון פנימי ← הורדות ← גשר בלוטוס ← a.jpg". */
+fun friendlyPath(p: String): String {
+    val root = Environment.getExternalStorageDirectory().path
+    if (!p.startsWith(root)) return p.split('/').filter { it.isNotEmpty() }.joinToString(" ← ")
+    val parts = p.removePrefix(root).split('/').filter { it.isNotEmpty() }.toMutableList()
+    // The phone's standard folders, by the names the user knows.
+    val known = mapOf("Download" to "הורדות", "DCIM" to "מצלמה", "Pictures" to "תמונות", "Documents" to "מסמכים",
+        "Movies" to "סרטונים", "Music" to "מוזיקה")
+    if (parts.isNotEmpty()) parts[0] = known[parts[0]] ?: parts[0]
+    return (listOf("זיכרון פנימי") + parts).joinToString(" ← ")
 }
 
 // ---------------------------------------------------------------------- settings
@@ -643,6 +691,11 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
             Toggle("לאפשר שליטה בטלפון", "מכשירים מוכרים יכולים לצפות במסך ולשלוט בו", b.store.allowControl) { b.store.allowControl = it }
             Toggle("רשת ישירה", "כשאין רשת משותפת, לפתוח נקודה חמה זמנית למחשב (להעברות גדולות ולשליטה). נסגרת לבד אחרי 90 שניות בלי שימוש.",
                 b.store.directMode != "off") { b.store.directMode = if (it) "auto" else "off" }
+            Toggle("לוח הדבקה משותף", "טקסט שמעתיקים במחשב אפשר להדביק בטלפון. מהטלפון למחשב: כשפותחים את האפליקציה, " +
+                "או בכפתור \"שלח את הלוח למחשב\" בהתראה של גשר בלוטוס (אנדרואיד לא מרשה לקרוא את הלוח ברקע).",
+                b.store.shareClipboard) { b.store.shareClipboard = it }
+            Toggle("התראות הטלפון במחשב", "התראות שמופיעות בטלפון יופיעו גם במחשב, ליד השעון. צריך לאשר \"גישה להתראות\" למטה.",
+                b.store.forwardNotifications) { b.store.forwardNotifications = it }
 
             HorizontalDivider()
             Text("הרשאות", fontWeight = FontWeight.SemiBold)
@@ -652,8 +705,13 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
             Perm("שליטה מהמחשב (נגישות)", "הגדרות ← נגישות ← גשר בלוטוס ← הפעל. בלי זה המחשב רק רואה את המסך.", BridgeAccessibility.isEnabled(ctx)) {
                 ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
-            Perm("מיקום (לרשת ישירה ולחיפוש מכשירים)", if (Build.VERSION.SDK_INT < 31) "באנדרואיד 11 צריך גם שהמיקום יהיה דלוק בזמן השימוש" else "",
+            Perm("מיקום (לרשת ישירה ולחיפוש מכשירים)",
+                if (Build.VERSION.SDK_INT < 31) "בחלון האישור בחר \"בזמן השימוש באפליקציה\" ולא \"רק הפעם\", אחרת תתבקש לאשר שוב בכל פעם. " +
+                    "באנדרואיד 11 צריך גם שהמיקום יהיה דלוק בזמן השימוש." else "",
                 nearbyGranted(ctx)) { perms.launch(nearbyPermissions()) }
+            Perm("גישה להתראות", "כדי שהתראות הטלפון יופיעו במחשב", BridgeNotifications.isEnabled(ctx)) {
+                runCatching { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+            }
             Perm("פעולה ברקע בלי הגבלה", "כדי שהחיבור לא ינותק כשהמסך כבוי",
                 ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) {
                 runCatching { ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + ctx.packageName))) }
@@ -677,6 +735,7 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
             }
             HorizontalDivider()
             Text("טביעת האצבע של הטלפון: ${com.btbridge.app.core.Crypto.fingerprintDigits(b.me.fp)}", style = MaterialTheme.typography.bodySmall)
+            Text("גרסה ${com.btbridge.app.core.AppInfo.version}", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
