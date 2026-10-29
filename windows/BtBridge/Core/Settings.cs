@@ -80,6 +80,14 @@ public sealed class TrustedDevice
     public string Os { get; set; } = "";
 }
 
+/// <summary>A folder or file on another device that the user saved for quick access.</summary>
+public sealed class SavedPlace
+{
+    public string Name { get; set; } = "";
+    public string Path { get; set; } = "";
+    public bool IsDir { get; set; } = true;
+}
+
 /// <summary>%APPDATA%\BtBridge\settings.json. Secrets (password key) are DPAPI-protected.</summary>
 public sealed class AppSettings
 {
@@ -119,6 +127,40 @@ public sealed class AppSettings
         }
         Save();
     }
+
+    /// <summary>Saved places ("שמורים") on each device, keyed by its fingerprint, in the order they were added.</summary>
+    public Dictionary<string, List<SavedPlace>> Saved { get; set; } = new();
+
+    public List<SavedPlace> SavedFor(string fp)
+    {
+        lock (Gate) return Saved.TryGetValue(fp, out var l) ? l.ToList() : new List<SavedPlace>();
+    }
+
+    public bool IsSaved(string fp, string path)
+    {
+        lock (Gate) return Saved.TryGetValue(fp, out var l) && l.Any(x => x.Path == path);
+    }
+
+    public void AddSaved(string fp, SavedPlace p)
+    {
+        lock (Gate)
+        {
+            if (!Saved.TryGetValue(fp, out var l)) Saved[fp] = l = new List<SavedPlace>();
+            if (l.Any(x => x.Path == p.Path)) return;
+            l.Add(p);
+        }
+        Save();
+    }
+
+    public void RemoveSaved(string fp, string path)
+    {
+        lock (Gate)
+        {
+            if (Saved.TryGetValue(fp, out var l)) l.RemoveAll(x => x.Path == path);
+        }
+        Save();
+    }
+
     public string PwSalt { get; set; } = "";
     public int PwIter { get; set; } = 50_000;
     public string PwKeyProtected { get; set; } = "";

@@ -89,7 +89,7 @@ object Handshake {
     const val VERSION = 2
 
     /** Optional features this side understands (PROTOCOL.md section 2, "caps"). */
-    val CAPS = listOf("clip", "notif", "resume", "ring", "battery", "update", "log")
+    val CAPS = listOf("clip", "notif", "resume", "ring", "battery", "update", "log", "search")
 
     /** PBKDF2 rounds a peer may ask for: fewer would make a captured proof easy to crack, more would freeze us. */
     const val MIN_ITER = 10_000

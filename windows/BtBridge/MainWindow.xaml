@@ -106,22 +106,43 @@
                 <Button Content="פתח" Click="Open_Click" />
                 <Button Content="שנה שם" Click="Rename_Click" ToolTip="F2" />
                 <Button Content="מחק" Click="Delete_Click" ToolTip="מחיקת הפריטים שנבחרו" />
+                <Button Content="☑ בחר הכל" Click="SelectAll_Click" ToolTip="Ctrl+A. אפשר גם לסמן כמה פריטים בתיבות הסימון שליד השמות" />
+                <Button x:Name="SavedBtn" Content="★ שמורים" Click="Saved_Click" ToolTip="תיקיות וקבצים ששמרת במכשיר הזה" />
             </WrapPanel>
-            <TextBox x:Name="PathBox" DockPanel.Dock="Top" Margin="3,6,3,6" FlowDirection="LeftToRight"
-                     KeyDown="PathBox_KeyDown" ToolTip="הקלד נתיב ולחץ אנטר" />
-            <TextBlock x:Name="SortText" DockPanel.Dock="Top" Margin="4,0,4,4" FontSize="12" Foreground="{StaticResource Muted}"
-                       ToolTip="לחיצה על כותרת עמודה משנה את המיון. הבחירה נשמרת לכל תיקייה." />
+            <DockPanel DockPanel.Dock="Top" Margin="3,6,3,6">
+                <Button DockPanel.Dock="Left" Content="🔍 חפש" Click="Search_Click" Margin="0" Padding="10,2"
+                        ToolTip="מחפש בתיקייה הזו ובכל תתי-התיקיות שלה" />
+                <Grid DockPanel.Dock="Left" Width="230" Margin="6,0,0,0">
+                    <TextBox x:Name="SearchBox" KeyDown="SearchBox_KeyDown" TextChanged="SearchBox_TextChanged"
+                             ToolTip="חיפוש לפי חלק מהשם, בתיקייה הזו ובכל תתי-התיקיות. אנטר מחפש, אסקייפ חוזר." />
+                    <TextBlock x:Name="SearchHint" Text="חיפוש בתיקייה הזו…" IsHitTestVisible="False" Margin="6,0"
+                               VerticalAlignment="Center" Foreground="{StaticResource Muted}" />
+                </Grid>
+                <TextBox x:Name="PathBox" FlowDirection="LeftToRight" KeyDown="PathBox_KeyDown" ToolTip="הקלד נתיב ולחץ אנטר" />
+            </DockPanel>
+            <DockPanel DockPanel.Dock="Top" Margin="4,0,4,4">
+                <TextBlock x:Name="SelectionText" DockPanel.Dock="Left" FontSize="12" Foreground="{StaticResource Accent}" />
+                <TextBlock x:Name="SortText" FontSize="12" Foreground="{StaticResource Muted}" TextTrimming="CharacterEllipsis"
+                           ToolTip="לחיצה על כותרת עמודה משנה את המיון. הבחירה נשמרת לכל תיקייה." />
+            </DockPanel>
             <Grid>
                 <ListView x:Name="FileList" SelectionMode="Extended" AllowDrop="True" BorderBrush="{StaticResource Line}"
                           MouseDoubleClick="FileList_MouseDoubleClick" Drop="FileList_Drop" DragOver="FileList_DragOver"
-                          KeyDown="FileList_KeyDown" GridViewColumnHeader.Click="Header_Click">
+                          KeyDown="FileList_KeyDown" GridViewColumnHeader.Click="Header_Click" SelectionChanged="FileList_SelectionChanged"
+                          ContextMenuOpening="FileList_ContextMenuOpening"
+                          PreviewMouseLeftButtonDown="FileList_MarqueeDown" PreviewMouseMove="FileList_MarqueeMove"
+                          PreviewMouseLeftButtonUp="FileList_MarqueeUp" LostMouseCapture="FileList_LostCapture">
                     <ListView.ContextMenu>
                         <ContextMenu>
                             <MenuItem Header="פתח" Click="Open_Click" />
+                            <MenuItem x:Name="MenuOpenFolder" Header="פתח את התיקייה שמכילה" Click="OpenContainingFolder_Click" />
                             <MenuItem Header="העתק (להדבקה בסייר הקבצים)" Click="Copy_Click" />
                             <MenuItem Header="⬇ הורד" Click="Download_Click" />
                             <MenuItem Header="שנה שם" Click="Rename_Click" />
                             <MenuItem Header="מחק" Click="Delete_Click" />
+                            <Separator />
+                            <MenuItem x:Name="MenuSave" Header="★ הוסף לשמורים" Click="SaveItems_Click" />
+                            <MenuItem x:Name="MenuUnsave" Header="הסר מהשמורים" Click="UnsaveItems_Click" />
                             <Separator />
                             <MenuItem Header="העתק נתיב" Click="CopyRemotePath_Click" />
                             <MenuItem Header="הדבק (העלה לכאן)" Click="Paste_Click" />
@@ -130,7 +151,19 @@
                     </ListView.ContextMenu>
                     <ListView.View>
                         <GridView>
-                            <GridViewColumn Header="שם" Width="430">
+                            <!-- A tick box on each row: several items can be marked with the mouse alone, no Ctrl needed. -->
+                            <GridViewColumn Width="34">
+                                <GridViewColumn.Header>
+                                    <CheckBox x:Name="AllBox" Click="AllBox_Click" ToolTip="סמן הכל / בטל סימון" />
+                                </GridViewColumn.Header>
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Focusable="False"
+                                                  IsChecked="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListViewItem}}" />
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                            <GridViewColumn Header="שם" Width="400">
                                 <GridViewColumn.CellTemplate>
                                     <DataTemplate>
                                         <StackPanel Orientation="Horizontal">
@@ -142,11 +175,17 @@
                             </GridViewColumn>
                             <GridViewColumn Header="גודל" Width="100" DisplayMemberBinding="{Binding SizeText}" />
                             <GridViewColumn Header="תאריך שינוי" Width="150" DisplayMemberBinding="{Binding DateText}" />
+                            <!-- Shown only for search results: where each one is. -->
+                            <GridViewColumn x:Name="FolderColumn" Header="תיקייה" Width="0" DisplayMemberBinding="{Binding Folder}" />
                         </GridView>
                     </ListView.View>
                 </ListView>
                 <TextBlock x:Name="Placeholder" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
                            Foreground="{StaticResource Muted}" FontSize="16" TextWrapping="Wrap" MaxWidth="480" />
+                <!-- The selection rectangle drawn while dragging with the mouse, as in File Explorer. -->
+                <Canvas IsHitTestVisible="False" ClipToBounds="True">
+                    <Rectangle x:Name="Marquee" Visibility="Collapsed" Stroke="#3B82F6" StrokeThickness="1" Fill="#333B82F6" />
+                </Canvas>
             </Grid>
         </DockPanel>
 

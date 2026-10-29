@@ -434,9 +434,16 @@ public partial class MainWindow : Window
             _path = path;
             _parent = listing.Parent;
             PathBox.Text = path;
-            ShowItems(listing.Items);
-            Placeholder.Text = listing.Items.Count == 0 ? "התיקייה ריקה. אפשר לגרור לכאן קבצים." : "";
-            Placeholder.Visibility = listing.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            EndSearchMode();
+            var items = listing.Items;
+            // The list of places starts with the user's saved places on this device.
+            if (path.Length == 0)
+                items = _b.Settings.SavedFor(s.PeerFp)
+                    .Select(p => new RemoteItem(p.Name, p.Path, p.IsDir, 0, 0) { Saved = true })
+                    .Concat(items).ToList();
+            ShowItems(items);
+            Placeholder.Text = items.Count == 0 ? "התיקייה ריקה. אפשר לגרור לכאן קבצים." : "";
+            Placeholder.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         catch (Exception ex)
         {
@@ -468,8 +475,8 @@ public partial class MainWindow : Window
 
     private void Header_Click(object sender, RoutedEventArgs e)
     {
-        if (e.OriginalSource is not GridViewColumnHeader h || h.Column == null || _path.Length == 0) return;
-        var by = h.Column.Header as string switch { "גודל" => "size", "תאריך שינוי" => "date", _ => "name" };
+        if (e.OriginalSource is not GridViewColumnHeader h || h.Column?.Header is not string header || _path.Length == 0 || _search != null) return;
+        var by = header switch { "גודל" => "size", "תאריך שינוי" => "date", _ => "name" };
         var (curBy, curDesc) = SortFor();
         // Same column flips the direction; a new column starts the natural way (dates and sizes biggest first).
         bool desc = by == curBy ? !curDesc : by is "date" or "size";
@@ -514,7 +521,271 @@ public partial class MainWindow : Window
 
     private async void Back_Click(object sender, RoutedEventArgs e)
     {
+        // From search results, "back" returns to the folder that was searched.
+        if (_search != null) { await Navigate(_path, remember: false); return; }
         if (_history.Count > 0) await Navigate(_history.Pop(), remember: false);
+    }
+
+    /// <summary>After a change: the search results again when searching, otherwise the folder.</summary>
+    private Task RefreshView() => _search is { } q ? RunSearch(q) : Navigate(_path, remember: false);
+
+    // ---------------------------------------------------------------- search
+
+    /// <summary>The text searched for while search results are shown; null while a folder is shown.</summary>
+    private string? _search;
+
+    private async void Search_Click(object sender, RoutedEventArgs e) => await RunSearch(SearchBox.Text.Trim());
+
+    private async void SearchBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter) { e.Handled = true; await RunSearch(SearchBox.Text.Trim()); }
+        else if (e.Key == Key.Escape && _search != null) { e.Handled = true; SearchBox.Text = ""; await Navigate(_path, remember: false); }
+    }
+
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) =>
+        SearchHint.Visibility = SearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>Searches the current folder and all its subfolders on the other device (PROTOCOL.md section 4, "search").</summary>
+    private async Task RunSearch(string q)
+    {
+        if (_current is not { } s) return;
+        if (q.Length == 0) { SearchBox.Focus(); return; }
+        var where = _path.Length == 0 ? "התיקייה הראשית של המשתמש" : _path;
+        Placeholder.Text = $"מחפש \"{q}\" ב-{where}…";
+        Placeholder.Visibility = Visibility.Visible;
+        _items.Clear();
+        try
+        {
+            var (items, more) = await RemoteFs.SearchAsync(s, _path, q);
+            if (s != _current) return;
+            _search = q;
+            FolderColumn.Width = 280;
+            foreach (var i in items) _items.Add(i);
+            SortText.Text = $"תוצאות החיפוש של \"{q}\" ב-{where}: {items.Count}" +
+                            (more ? " (מוצגות רק הראשונות. כדאי לחפש בתיקייה מצומצמת יותר)" : "") + ". \"חזור\" חוזר לתיקייה.";
+            Placeholder.Text = items.Count == 0 ? $"לא נמצא שום דבר עם \"{q}\" בשם." : "";
+            Placeholder.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        catch (Exception ex)
+        {
+            Placeholder.Text = "";
+            Err(ex, "החיפוש נכשל.");
+            await Navigate(_path, remember: false);
+        }
+    }
+
+    private void EndSearchMode()
+    {
+        _search = null;
+        FolderColumn.Width = 0;
+    }
+
+    private async void OpenContainingFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (FileList.SelectedItem is RemoteItem i && i.Folder.Length > 0) await Navigate(i.Folder);
+    }
+
+    // ---------------------------------------------------------------- marking several
+
+    private void SelectAll_Click(object sender, RoutedEventArgs e)
+    {
+        FileList.SelectAll();
+        FileList.Focus();
+    }
+
+    // Dragging with the mouse draws a rectangle and selects the rows it covers, as in File Explorer.
+    // Ctrl keeps what was already selected. Near the top or bottom edge the list scrolls by itself.
+    private Point? _marqueeFrom;
+    private bool _marqueeOn;
+    private int _marqueeAnchor = -1;
+    private List<RemoteItem> _marqueeBase = new();
+    private DispatcherTimer? _marqueeTimer;
+
+    private void FileList_MarqueeDown(object sender, MouseButtonEventArgs e)
+    {
+        _marqueeFrom = null;
+        if (e.ClickCount > 1 || e.OriginalSource is not DependencyObject src) return;
+        if (Ancestor<System.Windows.Controls.Primitives.ScrollBar>(src) != null || Ancestor<GridViewColumnHeader>(src) != null
+            || Ancestor<CheckBox>(src) != null) return;
+        _marqueeFrom = e.GetPosition(FileList);
+        _marqueeBase = Keyboard.Modifiers.HasFlag(ModifierKeys.Control) ? SelectedItems() : new();
+    }
+
+    private void FileList_MarqueeMove(object sender, MouseEventArgs e)
+    {
+        if (_marqueeFrom is not { } from || e.LeftButton != MouseButtonState.Pressed) return;
+        var p = e.GetPosition(FileList);
+        if (!_marqueeOn)
+        {
+            if (Math.Abs(p.X - from.X) < 8 && Math.Abs(p.Y - from.Y) < 8) return;
+            _marqueeAnchor = IndexAt(from);
+            if (_marqueeAnchor < 0) return;
+            _marqueeOn = true;
+            FileList.CaptureMouse();
+            Marquee.Visibility = Visibility.Visible;
+            _marqueeTimer ??= new DispatcherTimer(TimeSpan.FromMilliseconds(60), DispatcherPriority.Input, (_, _) => MarqueeTick(), Dispatcher);
+            _marqueeTimer.Start();
+        }
+        e.Handled = true;
+        MarqueeUpdate(p);
+    }
+
+    private void FileList_MarqueeUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_marqueeOn) e.Handled = true;
+        EndMarquee();
+    }
+
+    private void FileList_LostCapture(object sender, MouseEventArgs e) => EndMarquee();
+
+    private void EndMarquee()
+    {
+        _marqueeFrom = null;
+        if (!_marqueeOn) return;
+        _marqueeOn = false;
+        _marqueeTimer?.Stop();
+        Marquee.Visibility = Visibility.Collapsed;
+        if (FileList.IsMouseCaptured) FileList.ReleaseMouseCapture();
+    }
+
+    /// <summary>While the mouse is held near the top or bottom edge, the list keeps scrolling and the selection follows.</summary>
+    private void MarqueeTick()
+    {
+        if (!_marqueeOn) return;
+        var p = Mouse.GetPosition(FileList);
+        var sv = Descendant<ScrollViewer>(FileList);
+        if (sv == null) return;
+        if (p.Y < 32) sv.LineUp();
+        else if (p.Y > FileList.ActualHeight - 12) sv.LineDown();
+        else return;
+        FileList.UpdateLayout();
+        MarqueeUpdate(p);
+    }
+
+    private void MarqueeUpdate(Point p)
+    {
+        if (_marqueeFrom is not { } from) return;
+        var r = new Rect(from, p);
+        Canvas.SetLeft(Marquee, r.X);
+        Canvas.SetTop(Marquee, r.Y);
+        Marquee.Width = r.Width;
+        Marquee.Height = r.Height;
+        // In a list of rows the rectangle covers a range of rows: from the row where the drag began to the row under the mouse.
+        int cur = IndexAt(p);
+        if (cur < 0 || _marqueeAnchor < 0) return;
+        int lo = Math.Min(cur, _marqueeAnchor), hi = Math.Max(cur, _marqueeAnchor);
+        var want = new HashSet<RemoteItem>(_marqueeBase);
+        for (int i = lo; i <= hi && i < _items.Count; i++) want.Add(_items[i]);
+        foreach (var x in FileList.SelectedItems.Cast<RemoteItem>().Where(x => !want.Contains(x)).ToList()) FileList.SelectedItems.Remove(x);
+        foreach (var x in want) if (!FileList.SelectedItems.Contains(x)) FileList.SelectedItems.Add(x);
+    }
+
+    /// <summary>The row under a point of the list (the nearest one when the point is between, above or below rows), or -1.</summary>
+    private int IndexAt(Point p)
+    {
+        if (_items.Count == 0) return -1;
+        if (FileList.InputHitTest(p) is DependencyObject hit && Ancestor<ListViewItem>(hit) is { } row)
+            return FileList.ItemContainerGenerator.IndexFromContainer(row);
+        int best = -1;
+        double bestDist = double.MaxValue;
+        for (int i = 0; i < _items.Count; i++)
+        {
+            if (FileList.ItemContainerGenerator.ContainerFromIndex(i) is not ListViewItem c || !c.IsVisible) continue;
+            var b = c.TransformToAncestor(FileList).TransformBounds(new Rect(c.RenderSize));
+            double d = p.Y < b.Top ? b.Top - p.Y : p.Y > b.Bottom ? p.Y - b.Bottom : 0;
+            if (d < bestDist) { bestDist = d; best = i; }
+        }
+        return best;
+    }
+
+    private static T? Ancestor<T>(DependencyObject? d) where T : DependencyObject
+    {
+        while (d != null && d is not T)
+            d = d is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(d) : LogicalTreeHelper.GetParent(d);
+        return d as T;
+    }
+
+    private static T? Descendant<T>(DependencyObject d) where T : DependencyObject
+    {
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(d); i++)
+        {
+            var c = VisualTreeHelper.GetChild(d, i);
+            if (c is T t) return t;
+            if (Descendant<T>(c) is { } found) return found;
+        }
+        return null;
+    }
+
+    private void AllBox_Click(object sender, RoutedEventArgs e)
+    {
+        if (AllBox.IsChecked == true) FileList.SelectAll();
+        else FileList.UnselectAll();
+    }
+
+    private void FileList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        int n = FileList.SelectedItems.Count;
+        SelectionText.Text = n > 1 ? $"נבחרו {n} פריטים  ·  " : "";
+        AllBox.IsChecked = _items.Count > 0 && n == _items.Count;
+    }
+
+    // ---------------------------------------------------------------- saved places
+
+    /// <summary>The "★ שמורים" button: the saved places on this device, and adding or removing the current folder.</summary>
+    private void Saved_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is not { } s) return;
+        var menu = new ContextMenu { FlowDirection = FlowDirection.RightToLeft, PlacementTarget = SavedBtn, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        var saved = _b.Settings.SavedFor(s.PeerFp);
+        if (saved.Count == 0)
+            menu.Items.Add(new MenuItem { Header = "עוד אין שמורים. אפשר לשמור תיקייה או קובץ בקליק ימני.", IsEnabled = false });
+        foreach (var p in saved)
+        {
+            var item = new MenuItem { Header = (p.IsDir ? "📁 " : "📄 ") + p.Name, ToolTip = p.Path };
+            item.Click += async (_, _) => await OpenItem(new RemoteItem(p.Name, p.Path, p.IsDir, 0, 0));
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new Separator());
+        bool here = _path.Length > 0 && _search == null;
+        bool isSaved = here && _b.Settings.IsSaved(s.PeerFp, _path);
+        var add = new MenuItem { Header = "★ שמור את התיקייה הנוכחית", IsEnabled = here && !isSaved };
+        add.Click += (_, _) => _b.Settings.AddSaved(s.PeerFp, new SavedPlace { Name = FolderName(_path), Path = _path, IsDir = true });
+        menu.Items.Add(add);
+        var remove = new MenuItem { Header = "הסר את התיקייה הנוכחית מהשמורים", IsEnabled = isSaved };
+        remove.Click += (_, _) => _b.Settings.RemoveSaved(s.PeerFp, _path);
+        menu.Items.Add(remove);
+        menu.IsOpen = true;
+    }
+
+    private static string FolderName(string path)
+    {
+        var t = path.TrimEnd('\\', '/');
+        var cut = t.LastIndexOfAny(new[] { '\\', '/' });
+        return cut >= 0 && cut < t.Length - 1 ? t[(cut + 1)..] : t;
+    }
+
+    private void SaveItems_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is not { } s) return;
+        foreach (var i in SelectedItems().Where(i => !i.Saved))
+            _b.Settings.AddSaved(s.PeerFp, new SavedPlace { Name = i.Name, Path = i.Path, IsDir = i.IsDir });
+        ((App)Application.Current).Balloon("נשמר. אפשר לחזור אליו מהכפתור \"★ שמורים\" או מרשימת המקומות.");
+    }
+
+    private async void UnsaveItems_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is not { } s) return;
+        foreach (var i in SelectedItems()) _b.Settings.RemoveSaved(s.PeerFp, i.Path);
+        if (_path.Length == 0 && _search == null) await Navigate("", remember: false);
+    }
+
+    private void FileList_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        var sel = SelectedItems();
+        var fp = _current?.PeerFp ?? "";
+        MenuOpenFolder.Visibility = _search != null || (_path.Length == 0 && sel.Any(i => i.Saved)) ? Visibility.Visible : Visibility.Collapsed;
+        MenuSave.IsEnabled = sel.Any(i => !_b.Settings.IsSaved(fp, i.Path));
+        MenuUnsave.IsEnabled = sel.Any(i => _b.Settings.IsSaved(fp, i.Path));
     }
 
     private async void Up_Click(object sender, RoutedEventArgs e)
@@ -601,20 +872,21 @@ public partial class MainWindow : Window
 
     private async void Rename_Click(object sender, RoutedEventArgs e)
     {
-        if (_current is not { } s || !CheckInFolder() || FileList.SelectedItem is not RemoteItem i) return;
+        if (_current is not { } s || !CheckInFolder(inResults: true) || FileList.SelectedItem is not RemoteItem i) return;
         var d = new InputWindow("שינוי שם", "שם חדש:", i.Name) { Owner = this };
         if (d.ShowDialog() != true || d.Value == i.Name) return;
         try
         {
-            await RemoteFs.RenameAsync(s, i.Path, RemoteFs.Join(s, _path, d.Value));
-            await Navigate(_path, remember: false);
+            // In search results the item may sit in a subfolder: rename it where it is.
+            await RemoteFs.RenameAsync(s, i.Path, RemoteFs.Join(s, i.Folder.Length > 0 ? i.Folder : _path, d.Value));
+            await RefreshView();
         }
         catch (Exception ex) { Err(ex); }
     }
 
     private async void Delete_Click(object sender, RoutedEventArgs e)
     {
-        if (_current is not { } s || !CheckInFolder()) return;
+        if (_current is not { } s || !CheckInFolder(inResults: true)) return;
         var sel = SelectedItems();
         if (sel.Count == 0) return;
         var what = sel.Count == 1 ? $"\"{sel[0].Name}\"" : $"{sel.Count} פריטים";
@@ -623,12 +895,13 @@ public partial class MainWindow : Window
                 MessageBoxResult.No, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign) != MessageBoxResult.Yes) return;
         try { await RemoteFs.DeleteAsync(s, sel.Select(x => x.Path)); }
         catch (Exception ex) { Err(ex); }
-        await Navigate(_path, remember: false);
+        await RefreshView();
     }
 
-    private bool CheckInFolder()
+    /// <summary>Most actions need a real folder. Renaming and deleting also work on search results.</summary>
+    private bool CheckInFolder(bool inResults = false)
     {
-        if (_path.Length > 0) return true;
+        if (_path.Length > 0 || (inResults && _search != null)) return true;
         MessageBox.Show("היכנס קודם לתיקייה.", "גשר בלוטוס");
         return false;
     }

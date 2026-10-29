@@ -127,10 +127,70 @@ class FileService(
         }
         "read" -> { read(s, id, req); null }
         "write" -> write(s, id, req)
+        "search" -> search(path(req, "path"), path(req, "q"), req.optInt("max", 500))
         else -> throw RemoteException("unknown", "פעולה לא מוכרת: $op")
     }
 
     private fun ok() = JSONObject().put("ok", true)
+
+    // ------------------------------------------------------------------ search
+
+    /**
+     * PROTOCOL.md section 4, "search": names containing [q] (any case) under a folder and all its subfolders.
+     * Hidden folders (starting with ".") are skipped. Stops at [max] results or after 20 seconds ("more": true).
+     */
+    private fun search(path: String, q: String, max: Int): JSONObject {
+        val query = q.trim()
+        if (query.isEmpty()) throw RemoteException("bad", "הזן מה לחפש")
+        val root = if (path.isEmpty()) home else File(path)
+        if (!root.isDirectory) throw RemoteException("notfound", "התיקייה לא קיימת: ${root.path}")
+        val limit = max.coerceIn(1, 2000)
+        val until = System.currentTimeMillis() + 20_000
+        // Several threads read folders at the same time; only matching names become results.
+        val dirs = java.util.concurrent.ConcurrentLinkedQueue<File>().apply { add(root) }
+        val found = java.util.concurrent.ConcurrentLinkedQueue<File>()
+        val busy = java.util.concurrent.atomic.AtomicInteger()
+        val count = java.util.concurrent.atomic.AtomicInteger()
+        val stop = java.util.concurrent.atomic.AtomicBoolean()
+        val more = java.util.concurrent.atomic.AtomicBoolean()
+        val workers = (1..4).map {
+            Thread {
+                while (!stop.get()) {
+                    // Counted as busy before taking a folder, so "queue empty and nobody busy" really means done.
+                    busy.incrementAndGet()
+                    val dir = dirs.poll()
+                    if (dir == null) {
+                        if (busy.decrementAndGet() == 0 && dirs.isEmpty()) break
+                        Thread.sleep(1)
+                        continue
+                    }
+                    try {
+                        for (f in dir.listFiles() ?: emptyArray()) {
+                            if (stop.get()) break
+                            if (f.name.startsWith(".")) continue
+                            if (f.isDirectory) dirs.add(f)
+                            if (!f.name.contains(query, ignoreCase = true)) continue
+                            if (count.incrementAndGet() > limit) { more.set(true); stop.set(true); break }
+                            found.add(f)
+                        }
+                        if (System.currentTimeMillis() > until) { more.set(true); stop.set(true) }
+                    } catch (_: Exception) {
+                        // A folder that can't be read is skipped.
+                    } finally {
+                        busy.decrementAndGet()
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+        }
+        workers.forEach { it.join() }
+        // Nearer results first: by how deep they are, then by name.
+        val items = JSONArray()
+        found.sortedWith(compareBy<File>({ it.path.count { c -> c == '/' } }, { it.name.lowercase() })).forEach { items.put(item(it)) }
+        return JSONObject().put("items", items).put("more", more.get()).put("root", root.path)
+    }
+
+    private fun item(f: File) = JSONObject().put("n", f.name).put("p", f.path).put("d", f.isDirectory)
+        .put("s", if (f.isFile) f.length() else 0).put("m", f.lastModified())
 
     private fun path(o: JSONObject, key: String): String = o.str(key) ?: throw RemoteException("bad", "חסר שדה: $key")
 

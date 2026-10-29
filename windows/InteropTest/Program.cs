@@ -16,6 +16,14 @@ if (mode == "icon")
     BtBridge.AppIcon.WriteIco(args[1]);
     return 0;
 }
+if (mode == "search")
+{
+    // Timing helper: how long a search takes on this computer (no connection involved).
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var res = FileService.Search(args[1], args[2], 500);
+    Console.WriteLine($"{res["items"]!.AsArray().Count} results, more={res["more"]}, {sw.ElapsedMilliseconds} ms");
+    return 0;
+}
 if (mode == "setpw")
 {
     // Smoke test helper: give a settings folder a password so the app skips its first-run dialog.
@@ -124,6 +132,11 @@ try
     sent = tr.Done;
     Check(Pattern.Same(File.ReadAllBytes(resumed), 3_000_000), "resumed download content");
     Console.WriteLine("RESUME-DOWNLOAD ok");
+
+    // Search: a name inside a subfolder is found, with its folder, and the case of the letters doesn't matter.
+    var (found, _) = await RemoteFs.SearchAsync(s, remoteDir, "FINDME");
+    Check(found.Any(x => x.Name == "deep-findme.txt" && x.Folder.EndsWith("sub")), "search: " + string.Join(", ", found.Select(x => x.Path)));
+    Console.WriteLine("SEARCH ok");
 
     var up = Path.Combine(Log.Dir, "up.bin");
     File.WriteAllBytes(up, Pattern.Make(2_500_000));

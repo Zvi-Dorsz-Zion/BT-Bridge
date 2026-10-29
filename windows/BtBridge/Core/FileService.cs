@@ -131,6 +131,8 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
                 return await ReadAsync(s, id, req);
             case "write":
                 return Write(s, id, req);
+            case "search":
+                return await Task.Run(() => Search(Str(req, "path"), Str(req, "q"), req["max"]?.GetValue<int>() ?? 500));
             default:
                 throw new RemoteException("unknown", "פעולה לא מוכרת: " + op);
         }
@@ -144,6 +146,87 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
     private static bool Exists(string p) => File.Exists(p) || Directory.Exists(p);
 
     private static long Ms(DateTime utc) => new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeMilliseconds();
+
+    // ---------------------------------------------------------------- search
+
+    /// <summary>
+    /// PROTOCOL.md section 4, "search": names containing <paramref name="q"/> (any case) under a folder and all its subfolders.
+    /// Hidden and system folders are skipped. Stops at <paramref name="max"/> results or after 20 seconds ("more": true).
+    /// </summary>
+    public static JsonObject Search(string path, string q, int max)
+    {
+        q = q.Trim();
+        if (q.Length == 0) throw new RemoteException("bad", "הזן מה לחפש");
+        var root = path.Length == 0 ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : path;
+        if (!Directory.Exists(root)) throw new RemoteException("notfound", "התיקייה לא קיימת: " + root);
+        max = Math.Clamp(max, 1, 2000);
+        var st = new SearchState { Until = Environment.TickCount64 + 20_000 };
+        st.Dirs.Enqueue(root);
+        var opts = new EnumerationOptions
+        {
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
+        };
+        // Several threads read folders at the same time (much faster on a disk with many small folders).
+        // Names are compared while a folder is read, and only matches become objects.
+        void Worker()
+        {
+            while (!st.Stop)
+            {
+                // Counted as busy before taking a folder, so "queue empty and nobody busy" really means done.
+                Interlocked.Increment(ref st.Busy);
+                if (!st.Dirs.TryDequeue(out var dir))
+                {
+                    if (Interlocked.Decrement(ref st.Busy) == 0 && st.Dirs.IsEmpty) return;
+                    Thread.Sleep(1);
+                    continue;
+                }
+                try
+                {
+                    var entries = new System.IO.Enumeration.FileSystemEnumerable<bool>(dir,
+                        (ref System.IO.Enumeration.FileSystemEntry e) =>
+                        {
+                            // Junctions and links are not followed: they lead to folders seen elsewhere, or in circles.
+                            if (e.IsDirectory && (e.Attributes & FileAttributes.ReparsePoint) == 0) st.Dirs.Enqueue(e.ToFullPath());
+                            if (!e.FileName.Contains(q, StringComparison.OrdinalIgnoreCase)) return false;
+                            if (Interlocked.Increment(ref st.Count) > max) { st.Stop = st.More = true; return false; }
+                            st.Found.Enqueue(new JsonObject
+                            {
+                                ["n"] = e.FileName.ToString(),
+                                ["p"] = e.ToFullPath(),
+                                ["d"] = e.IsDirectory,
+                                ["s"] = e.IsDirectory ? 0 : e.Length,
+                                ["m"] = Ms(e.LastWriteTimeUtc.UtcDateTime),
+                            });
+                            return true;
+                        }, opts);
+                    foreach (var _ in entries)
+                        if (st.Stop) break;
+                    if (Environment.TickCount64 > st.Until) st.Stop = st.More = true;
+                }
+                catch (Exception) { /* a folder that can't be read is skipped */ }
+                finally { Interlocked.Decrement(ref st.Busy); }
+            }
+        }
+        var workers = Enumerable.Range(0, Math.Clamp(Environment.ProcessorCount, 2, 8))
+            .Select(_ => Task.Factory.StartNew(Worker, TaskCreationOptions.LongRunning)).ToArray();
+        Task.WaitAll(workers);
+        // Nearer results first: by how deep they are, then by name.
+        var items = new JsonArray();
+        foreach (var o in st.Found.OrderBy(o => o["p"]!.GetValue<string>().Count(c => c == '\\'))
+                     .ThenBy(o => o["n"]!.GetValue<string>(), StringComparer.CurrentCultureIgnoreCase))
+            items.Add(o);
+        return new JsonObject { ["items"] = items, ["more"] = st.More, ["root"] = root };
+    }
+
+    private sealed class SearchState
+    {
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Dirs = new();
+        public readonly System.Collections.Concurrent.ConcurrentQueue<JsonObject> Found = new();
+        public volatile bool Stop, More;
+        public int Busy, Count;
+        public long Until;
+    }
 
     // ---------------------------------------------------------------- list
 

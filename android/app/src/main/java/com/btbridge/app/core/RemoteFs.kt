@@ -11,7 +11,13 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-data class RemoteItem(val name: String, val path: String, val isDir: Boolean, val size: Long, val mtime: Long)
+data class RemoteItem(val name: String, val path: String, val isDir: Boolean, val size: Long, val mtime: Long) {
+    /** The folder that holds it (shown next to search results). */
+    val folder: String get() = if (path.length > name.length) path.dropLast(name.length).trimEnd('\\', '/') else ""
+}
+
+/** Search results; [more] is true when the other side stopped early (too many results, or too long). */
+class SearchResult(val items: List<RemoteItem>, val more: Boolean)
 
 class RemoteListing(val items: List<RemoteItem>, val parent: String?)
 
@@ -85,14 +91,25 @@ object RemoteFs {
         while (true) {
             val res = s.request(JSONObject().put("op", "list").put("path", path).put("offset", items.size))
             parent = res.str("parent")
-            val arr = res.getJSONArray("items")
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                items += RemoteItem(o.getString("n"), o.getString("p"), o.getBoolean("d"), o.long("s"), o.long("m"))
-            }
+            items += items(res)
             if (res.bool("more") != true) break
         }
         return RemoteListing(items, parent)
+    }
+
+    private fun items(res: JSONObject): List<RemoteItem> {
+        val arr = res.getJSONArray("items")
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            RemoteItem(o.getString("n"), o.getString("p"), o.getBoolean("d"), o.long("s"), o.long("m"))
+        }
+    }
+
+    /** Files and folders whose name contains [q], under [path] and its subfolders (PROTOCOL.md section 4, "search"). */
+    fun search(s: Session, path: String, q: String): SearchResult {
+        if (!s.has("search")) throw RemoteException("unsupported", "במכשיר השני מותקנת גרסה בלי חיפוש. עדכן אותו.")
+        val res = s.request(JSONObject().put("op", "search").put("path", path).put("q", q).put("max", 500), timeoutSec = 60)
+        return SearchResult(items(res), res.bool("more") == true)
     }
 
     fun mkdir(s: Session, path: String) { s.request(JSONObject().put("op", "mkdir").put("path", path)) }
