@@ -720,6 +720,8 @@ private fun fetch(peerFp: String, i: RemoteItem, local: File): Transfer =
             if (i.size > BIG) App.bridge.ensureFastLink(ss)
             RemoteFs.download(ss, i.path, local, t, i.size, i.mtime)
         }
+        // So it shows up right away in "Downloads", the gallery and file managers (viewing copies are skipped).
+        App.bridge.mediaScan(listOf(local))
     }
 
 private fun openRemote(s: Session, i: RemoteItem) {

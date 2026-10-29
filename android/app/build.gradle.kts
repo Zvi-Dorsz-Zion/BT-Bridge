@@ -16,8 +16,8 @@ android {
         minSdk = 29
         targetSdk = 34
         // בכל גרסה חדשה להגדיל את versionCode, אחרת הטלפון לא יתקין עדכון
-        versionCode = 8
-        versionName = "0.3.1"
+        versionCode = 9
+        versionName = "0.3.2"
     }
 
     // חתימה קבועה: signing/btbridge.jks + signing/keystore.properties (לגבות! בלי הקובץ אי אפשר להתקין עדכונים)
