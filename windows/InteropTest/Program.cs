@@ -16,6 +16,9 @@ if (mode == "icon")
     BtBridge.AppIcon.WriteIco(args[1]);
     return 0;
 }
+if (mode == "apptest") return AppTests.RunWindow();
+if (mode == "classictest") return AppTests.RunClassic();
+if (mode == "browsertest") return await AppTests.RunBrowser(args.Length > 1 ? args[1] : "edge");
 if (mode == "search")
 {
     // Timing helper: how long a search takes on this computer (no connection involved).

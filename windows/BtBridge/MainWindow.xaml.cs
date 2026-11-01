@@ -115,10 +115,13 @@ public partial class MainWindow : Window
 
     private void UpdateBanner(ScreenSource src)
     {
-        if (ScreenSource.Count > 0)
+        // The red strip only when the whole screen is shared. One program or the separate browser
+        // doesn't touch the screen; that gets a message next to the clock instead.
+        var full = ScreenSource.All.FirstOrDefault(x => x.IsFullScreen);
+        if (full != null)
         {
             _banner ??= new ControlBanner(() => ScreenSource.StopAll());
-            _banner.SetText($"📱 {_b.DisplayName(src.Session)} צופה במסך ושולט בו");
+            _banner.SetText($"📱 {_b.DisplayName(full.Session)} צופה במסך ושולט בו");
             _banner.Show();
         }
         else
@@ -240,6 +243,8 @@ public partial class MainWindow : Window
         bool phone = d.Session.PeerOs == "android";
         PhoneScreenBtn.Visibility = phone ? Visibility.Visible : Visibility.Collapsed;
         RingBtn.Visibility = phone && d.Session.Has("ring") ? Visibility.Visible : Visibility.Collapsed;
+        NotesBtn.Visibility = phone && d.Session.Has("notif-act") ? Visibility.Visible : Visibility.Collapsed;
+        PhoneAppsBtn.Visibility = phone && d.Session.Has("launch") ? Visibility.Visible : Visibility.Collapsed;
         ShowVersionNotice(d.Session);
         if (_current != d.Session)
         {
@@ -311,6 +316,13 @@ public partial class MainWindow : Window
     {
         if (_current is not { } s) return;
         new PhoneScreenWindow(s, _b.DisplayName(s)).Show();
+    }
+
+    private void Notes_Click(object sender, RoutedEventArgs e) => ((App)Application.Current).ShowNotes();
+
+    private void PhoneApps_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current is { } s) new PhoneAppsWindow(s) { Owner = this }.ShowDialog();
     }
 
     public static string BatteryText(Session s) =>

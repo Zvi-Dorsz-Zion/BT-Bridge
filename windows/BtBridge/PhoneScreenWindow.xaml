@@ -21,6 +21,7 @@
             <Button Content="🔔" Click="Notifications_Click" ToolTip="התראות" />
             <Button Content="⚙" Click="Quick_Click" ToolTip="הגדרות מהירות" />
             <Button Content="🔒" Click="Lock_Click" ToolTip="נעילת מסך" />
+            <Button Content="📲 אפליקציות" Click="Apps_Click" ToolTip="פתיחת אפליקציה בטלפון" />
             <ComboBox x:Name="ProfileBox" Width="110" Margin="3" SelectionChanged="Profile_Changed" Focusable="False">
                 <ComboBoxItem Content="איכות: אוטומטי" Tag="auto" IsSelected="True" />
                 <ComboBoxItem Content="חד" Tag="sharp" />

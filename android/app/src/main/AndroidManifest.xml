@@ -42,6 +42,14 @@
 
     <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
 
+    <!-- The computer lists the phone's apps to open one (Android 11+ shows apps only when asked for like this) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".App"
         android:allowBackup="false"

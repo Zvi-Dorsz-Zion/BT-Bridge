@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Checklist
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyListState
@@ -124,7 +125,7 @@ private val dateFmt = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US)
 /** Browses the other device's files. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRemote: () -> Unit) {
+fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRemote: () -> Unit, onApps: () -> Unit) {
     val b = App.bridge
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -331,6 +332,10 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
                                 onClick = { menu = false; pickInbox.launch(arrayOf("*/*")) })
                             if (s.peerOs == "windows") DropdownMenuItem(text = { Text("שליטה במסך המחשב") }, leadingIcon = { Icon(Icons.Filled.DesktopWindows, null) },
                                 onClick = { menu = false; onRemote() })
+                            if (s.has("window") || s.has("browser")) DropdownMenuItem(
+                                text = { Text("תוכנות במחשב ודפדפן (בלי להשתלט על המסך)") },
+                                leadingIcon = { Icon(Icons.Filled.Apps, null) },
+                                onClick = { menu = false; onApps() })
                             HorizontalDivider()
                             DropdownMenuItem(text = { Text("העלה קבצים לתיקייה הזו…") }, leadingIcon = { Icon(Icons.Filled.Upload, null) }, enabled = inFolder,
                                 onClick = { menu = false; pickFiles.launch(arrayOf("*/*")) })

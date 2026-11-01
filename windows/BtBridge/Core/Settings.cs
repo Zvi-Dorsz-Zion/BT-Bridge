@@ -107,6 +107,10 @@ public sealed class AppSettings
     public bool ShareClipboard { get; set; } = true;
     /// <summary>Notifications that appear on the phone show up next to the clock here too.</summary>
     public bool ShowPhoneNotifications { get; set; } = true;
+    /// <summary>Which browser the other device controls as "a separate browser": "edge" or "chrome" (the other one if it is missing).</summary>
+    public string Browser { get; set; } = "edge";
+    /// <summary>The page the separate browser opens with.</summary>
+    public string BrowserHome { get; set; } = "https://www.google.com";
     /// <summary>Local nicknames by fingerprint (or by Bluetooth address for devices never connected).</summary>
     public Dictionary<string, string> Nicknames { get; set; } = new();
 
