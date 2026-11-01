@@ -8,6 +8,13 @@ using static BtBridge.Core.Crypto;
 
 namespace BtBridge.Core;
 
+/// <summary>A notification from the phone. <see cref="Key"/> lets the computer answer, open or close it there.</summary>
+public sealed record PhoneNote(Session S, string Key, string App, string Title, string Text, bool CanReply, DateTime At)
+{
+    public string Head => string.IsNullOrWhiteSpace(Title) ? App : $"{App} · {Title}";
+    public string When => At.ToString("HH:mm");
+}
+
 /// <summary>The app's core: Bluetooth listener, outgoing connections, sessions.</summary>
 public sealed class Bridge : IRequestHandler
 {
@@ -305,7 +312,7 @@ public sealed class Bridge : IRequestHandler
 
     // ---------------------------------------------------------------- IRequestHandler
 
-    public Task<JsonObject?> HandleAsync(Session s, uint id, JsonObject req)
+    public async Task<JsonObject?> HandleAsync(Session s, uint id, JsonObject req)
     {
         switch (req["op"]?.GetValue<string>())
         {
@@ -313,31 +320,62 @@ public sealed class Bridge : IRequestHandler
             {
                 if (!Settings.AllowControl)
                     throw new RemoteException("denied", "השליטה במחשב הזה כבויה בהגדרות של גשר בלוטוס במחשב");
-                var grab = Grabber();
-                var src = new ScreenSource(s, id, grab, Input, Codec, req);
+                ScreenSource src;
+                string mode = "screen";
+                if (req["browser"]?.GetValue<bool>() == true)
+                {
+                    // A separate browser that only the other device sees (PROTOCOL.md section 7).
+                    int vw = Math.Clamp(req["vw"]?.GetValue<int>() ?? 412, 320, 1600), vh = Math.Clamp(req["vh"]?.GetValue<int>() ?? 860, 400, 2400);
+                    var b = await RemoteBrowser.StartAsync(Settings.Browser, Settings.DownloadDir, Settings.BrowserHome, vw, vh);
+                    src = new ScreenSource(s, id, b, b, Codec, req) { Program = "דפדפן נפרד", Owned = b };
+                    b.PageChanged += (url, title) => src.Info(new JsonObject { ["url"] = url, ["title"] = title });
+                    mode = "browser";
+                }
+                else if (req["window"] is JsonNode wn)
+                {
+                    // One program's window, without the real mouse (PROTOCOL.md section 7).
+                    var h = new IntPtr(wn.GetValue<long>());
+                    AppWindows.Prepare(h);
+                    var grab = new WindowGrabber(h);
+                    ScreenSource? holder = null;
+                    var input = new WindowInput(grab, m => holder?.Info(new JsonObject { ["mode"] = m }));
+                    src = holder = new ScreenSource(s, id, grab, input, Codec, req) { Program = Native.Title(h), Owned = new Closer(input.Close) };
+                    mode = AppWindows.GuessMode(h);
+                }
+                else src = new ScreenSource(s, id, Grabber(), Input, Codec, req);
                 var mons = new JsonArray();
-                foreach (var m in grab.Monitors())
+                foreach (var m in src.Monitors())
                     mons.Add(new JsonObject { ["i"] = m.Index, ["name"] = m.Name, ["w"] = m.W, ["h"] = m.H, ["primary"] = m.Primary });
-                s.Reply(id, new JsonObject { ["ok"] = true, ["kind"] = "windows", ["monitors"] = mons });
+                s.Reply(id, new JsonObject { ["ok"] = true, ["kind"] = "windows", ["monitors"] = mons, ["mode"] = mode });
                 src.Start();
-                Notice?.Invoke($"{DisplayName(s)} צופה במסך ושולט בו");
-                return Task.FromResult<JsonObject?>(null);
+                Notice?.Invoke(src.IsFullScreen ? $"{DisplayName(s)} צופה במסך ושולט בו" : $"{DisplayName(s)} שולט ב: {src.Program}");
+                return null;
             }
+            case "windows":
+                return new JsonObject { ["ok"] = true, ["items"] = AppWindows.List(), ["browser"] = RemoteBrowser.FindBrowser(Settings.Browser) != null };
             case "direct":
                 throw new RemoteException("unsupported", "רשת ישירה נפתחת רק בטלפון");
             case "ring":
                 throw new RemoteException("unsupported", "צלצול קיים רק בטלפון");
             case "log":
-                return Task.FromResult<JsonObject?>(new JsonObject { ["ok"] = true, ["text"] = Log.Tail(64 * 1024) });
+                return new JsonObject { ["ok"] = true, ["text"] = Log.Tail(64 * 1024) };
             default:
-                return Files.HandleAsync(s, id, req);
+                return await Files.HandleAsync(s, id, req);
         }
+    }
+
+    private sealed class Closer(Action close) : IDisposable
+    {
+        public void Dispose() => close();
     }
 
     /// <summary>Text the other device copied (PROTOCOL.md section 5, "clip"). Raised on a worker thread.</summary>
     public event Action<Session, string>? ClipboardReceived;
-    /// <summary>A notification that appeared on the phone: app, title, text.</summary>
-    public event Action<Session, string, string, string>? PhoneNotification;
+    /// <summary>A notification that appeared on the phone.</summary>
+    public event Action<PhoneNote>? PhoneNotification;
+
+    /// <summary>The phone's recent notifications, newest first, for the "notifications from the phone" window.</summary>
+    public List<PhoneNote> Notes { get; } = new();
 
     /// <summary>Sends copied text to every connected device that shares the clipboard.</summary>
     public void ShareClipboard(string text)
@@ -367,10 +405,20 @@ public sealed class Bridge : IRequestHandler
                     ClipboardReceived?.Invoke(s, text);
                 break;
             case "notif":
-                if (Settings.ShowPhoneNotifications)
-                    PhoneNotification?.Invoke(s, ev["app"]?.GetValue<string>() ?? "", ev["title"]?.GetValue<string>() ?? "",
-                        ev["text"]?.GetValue<string>() ?? "");
+            {
+                if (!Settings.ShowPhoneNotifications) break;
+                var note = new PhoneNote(s, ev["key"]?.GetValue<string>() ?? "", ev["app"]?.GetValue<string>() ?? "",
+                    ev["title"]?.GetValue<string>() ?? "", ev["text"]?.GetValue<string>() ?? "", ev["reply"]?.GetValue<bool>() == true, DateTime.Now);
+                lock (Notes)
+                {
+                    // An update of the same notification replaces the older line.
+                    if (note.Key.Length > 0) Notes.RemoveAll(n => n.Key == note.Key && n.S.PeerFp == s.PeerFp);
+                    Notes.Insert(0, note);
+                    if (Notes.Count > 100) Notes.RemoveRange(100, Notes.Count - 100);
+                }
+                PhoneNotification?.Invoke(note);
                 break;
+            }
             case "battery":
                 s.Battery = ev["level"]?.GetValue<int>() ?? -1;
                 s.Charging = ev["charging"]?.GetValue<bool>() == true;

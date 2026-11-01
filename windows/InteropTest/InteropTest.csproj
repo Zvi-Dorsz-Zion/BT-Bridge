@@ -6,7 +6,19 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- "apptest" opens a small hidden window to check the one-program control for real. -->
+    <UseWPF>true</UseWPF>
+    <!-- ...and a classic window, where taps go as messages straight to the window. -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WPF projects leave System.IO out of the automatic usings. -->
+    <Using Include="System.IO" />
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\BtBridge\BtBridge.csproj" />

@@ -68,18 +68,39 @@ public partial class App : Application
         _tray.DoubleClick += (_, _) => ShowMain();
         Core.Notice += msg => Dispatcher.BeginInvoke(() => Balloon(msg));
         // The phone's notifications, next to the clock.
-        Core.PhoneNotification += (s, app, title, text) => Dispatcher.BeginInvoke(() =>
-            Balloon(string.IsNullOrWhiteSpace(text) ? title : (string.IsNullOrWhiteSpace(title) ? text : title + "\n" + text),
-                $"{Core.DisplayName(s)} · {app}"));
-        _tray.BalloonTipClicked += (_, _) => ShowMain();
+        Core.PhoneNotification += n => Dispatcher.BeginInvoke(() =>
+        {
+            Balloon(string.IsNullOrWhiteSpace(n.Text) ? n.Title : (string.IsNullOrWhiteSpace(n.Title) ? n.Text : n.Title + "\n" + n.Text),
+                $"{Core.DisplayName(n.S)} · {n.App}");
+            _noteBalloon = true;
+            _notes?.Refresh();
+        });
+        // A click on a phone notification opens the list, to answer or open it; any other message opens the main window.
+        _tray.BalloonTipClicked += (_, _) => { if (_noteBalloon) ShowNotes(); else ShowMain(); };
 
         // Started with Windows: stay next to the clock.
         if (e.Args.Contains("--tray")) _main = new MainWindow();
         else ShowMain();
     }
 
+    private bool _noteBalloon;
+    private NotesWindow? _notes;
+
+    /// <summary>The phone's notifications, with "answer", "open on the phone" and "close".</summary>
+    public void ShowNotes()
+    {
+        if (_notes == null)
+        {
+            _notes = new NotesWindow();
+            _notes.Closed += (_, _) => _notes = null;
+        }
+        _notes.Show();
+        _notes.Activate();
+    }
+
     public void Balloon(string msg, string title = "גשר בלוטוס")
     {
+        _noteBalloon = false;
         if (_tray == null || msg.Length == 0) return;
         _tray.BalloonTipTitle = title.Length > 60 ? title[..60] : title;
         _tray.BalloonTipText = msg.Length > 250 ? msg[..250] + "…" : msg;

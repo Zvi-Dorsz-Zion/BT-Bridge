@@ -235,9 +235,11 @@ class Bridge(private val ctx: Context) : RequestHandler {
     }
 
     /** A notification that appeared on this phone, for the computers (PROTOCOL.md section 5, "notif"). */
-    fun forwardNotification(app: String, title: String, text: String) {
+    fun forwardNotification(app: String, title: String, text: String, key: String = "", canReply: Boolean = false) {
         if (!store.forwardNotifications) return
+        // "key" and "reply" let the computer answer, open or close it (PROTOCOL.md section 4, "notif-reply"...).
         val ev = JSONObject().put("ev", "notif").put("app", app).put("title", title).put("text", text.take(2000))
+            .put("key", key).put("reply", canReply)
         for (s in sessions.value) if (s.has("notif")) runCatching { s.sendEvent(ev) }
     }
 
@@ -413,11 +415,18 @@ class Bridge(private val ctx: Context) : RequestHandler {
             JSONObject().put("ok", true)
         }
         "log" -> JSONObject().put("ok", true).put("text", Log.tail(64 * 1024))
+        // The computer opens an app on the phone, and acts on the phone's notifications (PROTOCOL.md section 4).
+        "apps" -> JSONObject().put("ok", true).put("items", PhoneApps.list(ctx))
+        "launch" -> { PhoneApps.launch(ctx, req.str("pkg") ?: ""); JSONObject().put("ok", true) }
+        "notif-reply" -> { BridgeNotifications.reply(ctx, req.str("key") ?: "", req.str("text") ?: ""); JSONObject().put("ok", true) }
+        "notif-open" -> { BridgeNotifications.open(req.str("key") ?: ""); JSONObject().put("ok", true) }
+        "notif-dismiss" -> { BridgeNotifications.dismiss(req.str("key") ?: ""); JSONObject().put("ok", true) }
         else -> files.handle(s, id, req)
     }
 
     override fun onEvent(s: Session, ev: JSONObject) {
         if (ScreenSource.onEvent(s, ev)) return
+        if (com.btbridge.app.core.ScreenClient.onEvent(s, ev)) return
         when (ev.str("ev")) {
             "clip" -> receiveClipboard(ev.str("text") ?: "")
             else -> wifi.onEvent(s, ev)

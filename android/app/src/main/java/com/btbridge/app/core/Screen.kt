@@ -263,20 +263,44 @@ class ScreenClient(private val s: Session) : StreamSink {
 
     var onFrame: ((seq: Long, w: Int, h: Int, tiles: List<ScreenTile>) -> Unit)? = null
     var onClosed: ((String) -> Unit)? = null
+    /** News about the stream ("screen-info"): the page address of the separate browser, the way taps work. */
+    var onInfo: ((JSONObject) -> Unit)? = null
+    /** "screen", "browser", "uia" (accessibility) or "window" (messages to the window). */
+    @Volatile var mode = ""
+        private set
 
-    /** Blocking. */
-    fun open(monitor: Int, profile: String, restoreCursor: Boolean) {
+    /** Blocking. [extra] adds fields: "window" (one program) or "browser" (PROTOCOL.md section 7). */
+    fun open(monitor: Int, profile: String, restoreCursor: Boolean, extra: (JSONObject.() -> Unit)? = null) {
         id = s.newId()
         s.expectStream(id, this, sticky = false)
+        clients[key(s, id)] = this
         try {
-            val res = s.request(JSONObject().put("op", "screen-open").put("monitor", monitor)
-                .put("profile", profile).put("restoreCursor", restoreCursor), id = id, timeoutSec = 100)
+            val req = JSONObject().put("op", "screen-open").put("monitor", monitor)
+                .put("profile", profile).put("restoreCursor", restoreCursor)
+            extra?.invoke(req)
+            val res = s.request(req, id = id, timeoutSec = 100)
             kind = res.str("kind") ?: ""
+            mode = res.str("mode") ?: "screen"
             val arr = res.optJSONArray("monitors") ?: JSONArray()
             monitors = (0 until arr.length()).map { arr.getJSONObject(it) }
         } catch (e: Exception) {
             s.forgetStream(id)
+            clients.remove(key(s, id))
             throw e
+        }
+    }
+
+    companion object {
+        private val clients = ConcurrentHashMap<String, ScreenClient>()
+        private fun key(s: Session, id: Int) = "${System.identityHashCode(s)}:$id"
+
+        /** Routes "screen-info" to its viewer. Returns false when the event is something else. */
+        fun onEvent(s: Session, ev: JSONObject): Boolean {
+            if (ev.str("ev") != "screen-info") return false
+            val c = clients[key(s, ev.optInt("id"))] ?: return true
+            ev.str("mode")?.let { c.mode = it }
+            runCatching { c.onInfo?.invoke(ev) }
+            return true
         }
     }
 
@@ -295,7 +319,10 @@ class ScreenClient(private val s: Session) : StreamSink {
         runCatching { s.sendEvent(o) }
     }
 
-    fun close() = s.cancel(id)
+    fun close() {
+        clients.remove(key(s, id))
+        s.cancel(id)
+    }
 
     override fun onData(buf: ByteArray, off: Int, len: Int) {
         if (len == 0) return

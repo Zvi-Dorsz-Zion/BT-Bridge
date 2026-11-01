@@ -24,6 +24,10 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -90,12 +94,17 @@ private val keys = listOf(
     "רענון" to ("f5" to emptyList()), "צילום מסך" to ("prtsc" to emptyList()),
 )
 
+/** One program's window on the computer ([window]), or the separate browser ([browser]). */
+data class RemoteTarget(val title: String, val window: Long? = null, val browser: Boolean = false)
+
 /**
  * The computer's screen on the phone. One finger: tap = click, hold = right click, drag = drag.
  * Two fingers: pinch = zoom, move = scroll (or pan when zoomed in).
+ * With a [target], only that program (or the separate browser) is shown and controlled, and the computer's
+ * screen and mouse are left alone.
  */
 @Composable
-fun RemoteScreen(s: Session, onClose: () -> Unit) {
+fun RemoteScreen(s: Session, target: RemoteTarget?, onClose: () -> Unit) {
     val b = App.bridge
     val ctx = LocalContext.current
     val haptic = LocalHapticFeedback.current
@@ -104,7 +113,12 @@ fun RemoteScreen(s: Session, onClose: () -> Unit) {
     var profile by remember { mutableStateOf("auto") }
     var restoreCursor by remember { mutableStateOf(false) }
     val client = remember(s, reopen) { ScreenClient(s) }
-    var status by remember { mutableStateOf("מתחבר למסך המחשב…") }
+    var status by remember { mutableStateOf(if (target == null) "מתחבר למסך המחשב…" else "פותח את ${target.title}…") }
+    /** The separate browser's page, and how taps reach the program ("uia" / "window"). */
+    var pageUrl by remember { mutableStateOf("") }
+    var address by remember { mutableStateOf("") }
+    var mode by remember { mutableStateOf("") }
+    val config = androidx.compose.ui.platform.LocalConfiguration.current
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
     var version by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
@@ -158,11 +172,26 @@ fun RemoteScreen(s: Session, onClose: () -> Unit) {
             }
         }
         client.onClosed = { why -> main.post { status = "השיתוף הסתיים: $why" } }
+        client.onInfo = { ev ->
+            main.post {
+                ev.optString("url").takeIf { it.isNotEmpty() }?.let { if (pageUrl != it) { pageUrl = it; address = it } }
+                ev.optString("mode").takeIf { it.isNotEmpty() }?.let { mode = it }
+            }
+        }
         try {
             withContext(Dispatchers.IO) {
                 b.ensureFastLink(s)
-                client.open(monitor, profile, restoreCursor)
+                client.open(monitor, profile, restoreCursor) {
+                    when {
+                        target?.browser == true -> {
+                            // The page is laid out for this phone's screen, as a phone browser would.
+                            put("browser", true).put("vw", config.screenWidthDp).put("vh", (config.screenHeightDp - 56).coerceAtLeast(400))
+                        }
+                        target?.window != null -> put("window", target.window)
+                    }
+                }
             }
+            mode = client.mode
             status = "ממתין לתמונה…"
         } catch (e: Exception) {
             status = "השיתוף לא נפתח: ${com.btbridge.app.core.Heb.of(e)}"
@@ -295,7 +324,7 @@ fun RemoteScreen(s: Session, onClose: () -> Unit) {
                         }
                     }
                 }
-                Box {
+                if (target == null) Box {
                     IconButton(onClick = { menu = "monitor" }) { Icon(Icons.Filled.DesktopWindows, "מסך", tint = Color.White) }
                     DropdownMenu(menu == "monitor", { menu = "" }) {
                         client.monitors.forEach { m ->
@@ -312,10 +341,43 @@ fun RemoteScreen(s: Session, onClose: () -> Unit) {
                         )
                     }
                 }
-                Text("$fps תמונות/ש' · ${s.linkText}" + if (scale > 1.01f) " · ×${"%.1f".format(scale)}" else "",
+                // How taps reach the program: through accessibility, or as messages straight to its window.
+                val how = when (mode) {
+                    "uia" -> " · דרך נגישות"
+                    "window" -> " · ישירות לחלון"
+                    "browser" -> " · דפדפן נפרד"
+                    else -> ""
+                }
+                Text((target?.title?.let { "$it · " } ?: "") + "$fps תמונות/ש' · ${s.linkText}$how" +
+                    if (scale > 1.01f) " · ×${"%.1f".format(scale)}" else "",
                     Modifier.weight(1f).padding(horizontal = 6.dp), color = Color(0xFFD1D5DB), fontSize = 12.sp, maxLines = 1)
                 IconButton(onClick = { bar = false }) { Icon(Icons.Filled.ExpandLess, "הסתר", tint = Color.White) }
-            } else Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopEnd) {
+            }
+            // The separate browser: back, forward, reload and an address bar (an address, or words to search).
+            if (bar && target?.browser == true) Row(
+                Modifier.fillMaxWidth().background(Color(0xCC111827)).padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // The app is right to left, so these arrows already point the Hebrew way.
+                IconButton(onClick = { client.input("back") }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "אחורה", tint = Color.White) }
+                IconButton(onClick = { client.input("forward") }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "קדימה", tint = Color.White) }
+                IconButton(onClick = { client.input("reload") }) { Icon(Icons.Filled.Refresh, "רענן", tint = Color.White) }
+                BasicTextField(
+                    address, { address = it },
+                    Modifier.weight(1f).background(Color(0xFF374151)).padding(8.dp),
+                    singleLine = true,
+                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                    cursorBrush = SolidColor(Color.White),
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Go, autoCorrectEnabled = false),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onGo = {
+                        client.input("navigate", extra = { put("url", address) })
+                    }),
+                )
+                IconButton(onClick = { client.input("navigate", extra = { put("url", address) }) }) {
+                    Icon(Icons.Filled.Search, "עבור", tint = Color.White)
+                }
+            }
+            if (!bar) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopEnd) {
                 IconButton(onClick = { bar = true }, Modifier.background(Color(0x88111827))) {
                     Icon(Icons.Filled.ExpandMore, "הצג", tint = Color.White)
                 }

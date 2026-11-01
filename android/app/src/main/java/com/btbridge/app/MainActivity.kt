@@ -131,7 +131,10 @@ class MainActivity : ComponentActivity() {
 private sealed interface Screen {
     data object Home : Screen
     data class Explorer(val fp: String) : Screen
-    data class Remote(val fp: String) : Screen
+    /** The computer's whole screen, or (with [target]) one of its programs or the separate browser. */
+    data class Remote(val fp: String, val target: RemoteTarget? = null) : Screen
+    /** "Programs on the computer": pick one program or the separate browser. */
+    data class Apps(val fp: String) : Screen
     data object Transfers : Screen
     data object Settings : Screen
     data object Scan : Screen
@@ -155,12 +158,17 @@ private fun AppRoot(resumed: Int) {
             val session = sessions.firstOrNull { it.peerFp == s.fp }
             if (session == null) LaunchedEffect(Unit) { screen = Screen.Home }
             else ExplorerScreen(session, onBack = { screen = Screen.Home }, onTransfers = { screen = Screen.Transfers },
-                onRemote = { screen = Screen.Remote(s.fp) })
+                onRemote = { screen = Screen.Remote(s.fp) }, onApps = { screen = Screen.Apps(s.fp) })
         }
         is Screen.Remote -> {
             val session = sessions.firstOrNull { it.peerFp == s.fp }
             if (session == null) LaunchedEffect(Unit) { screen = Screen.Home }
-            else RemoteScreen(session, onClose = { screen = Screen.Explorer(s.fp) })
+            else RemoteScreen(session, s.target, onClose = { screen = if (s.target != null) Screen.Apps(s.fp) else Screen.Explorer(s.fp) })
+        }
+        is Screen.Apps -> {
+            val session = sessions.firstOrNull { it.peerFp == s.fp }
+            if (session == null) LaunchedEffect(Unit) { screen = Screen.Home }
+            else AppsScreen(session, onBack = { screen = Screen.Explorer(s.fp) }, onOpen = { screen = Screen.Remote(s.fp, it) })
         }
         Screen.Transfers -> TransfersScreen(onBack = { screen = Screen.Home })
         Screen.Settings -> SettingsScreen(resumed, onBack = { screen = Screen.Home })

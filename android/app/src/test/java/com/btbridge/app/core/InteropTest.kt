@@ -281,6 +281,11 @@ class InteropTest {
             RemoteFs.download(s, item.path, resumed, Transfer("resumed", false).apply { attempts = 1 }, item.size, item.mtime)
             assertTrue("resumed download", resumed.readBytes().contentEquals(pattern(3_000_000)))
 
+            // The computer's open windows, for "programs on the computer".
+            assertTrue("window control offered", s.has("window") && s.has("browser"))
+            val wins = s.request(JSONObject().put("op", "windows"))
+            assertTrue("windows list", wins.optJSONArray("items") != null && wins.has("browser"))
+
             // Search on the computer: a name inside a subfolder, in any letter case, with its folder.
             val found = RemoteFs.search(s, dir.path, "FINDME")
             assertTrue("search: ${found.items.map { it.path }}", found.items.any { it.name == "deep-findme.txt" && it.folder.endsWith("sub") })

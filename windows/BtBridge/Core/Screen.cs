@@ -157,6 +157,15 @@ public sealed class ScreenSource
 
     public static event Action<ScreenSource, bool>? ActiveChanged;
     public static int Count => Active.Count;
+    public static IEnumerable<ScreenSource> All => Active.Values;
+    public IReadOnlyList<MonitorInfo> Monitors() => _grab.Monitors();
+
+    /// <summary>What the other side sees: null for the whole screen, otherwise one program's window or the separate browser.</summary>
+    public string? Program { get; init; }
+    public bool IsFullScreen => Program == null;
+
+    /// <summary>Closed together with the stream (the separate browser, the input thread of a window).</summary>
+    public IDisposable? Owned { get; init; }
 
     public ScreenSource(Session s, uint id, IScreenGrabber grab, IInputSink input, ITileCodec codec, JsonObject req)
     {
@@ -188,6 +197,15 @@ public sealed class ScreenSource
         _ackSignal.Set();
         Active.TryRemove((Session, Id), out _);
         ActiveChanged?.Invoke(this, false);
+        try { Owned?.Dispose(); } catch (Exception ex) { Log.Write("screen source close: " + ex.Message); }
+    }
+
+    /// <summary>News for the viewer about this stream (PROTOCOL.md section 7, "screen-info"): the page address, the way taps work.</summary>
+    public void Info(JsonObject o)
+    {
+        o["ev"] = "screen-info";
+        o["id"] = Id;
+        try { Session.SendEvent(o); } catch { }
     }
 
     public static void StopAll(Session? s = null)

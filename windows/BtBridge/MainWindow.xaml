@@ -81,6 +81,8 @@
                     <Button x:Name="PhoneScreenBtn" Content="📱 מסך הטלפון" Click="PhoneScreen_Click" ToolTip="צפייה ושליטה במסך הטלפון" />
                     <Button Content="📤 שלח למכשיר…" Click="SendTo_Click" ToolTip="שולח קבצים לתיקיית ההורדות של המכשיר" />
                     <Button x:Name="RingBtn" Content="🔔 צלצל לטלפון" Click="Ring_Click" ToolTip="הטלפון יצלצל 30 שניות, גם כשהוא על שקט" />
+                    <Button x:Name="NotesBtn" Content="💬 התראות מהטלפון" Click="Notes_Click" ToolTip="לענות על הודעות, לפתוח או לסגור התראות של הטלפון" />
+                    <Button x:Name="PhoneAppsBtn" Content="📲 אפליקציות" Click="PhoneApps_Click" ToolTip="פתיחת אפליקציה בטלפון" />
                 </StackPanel>
                 <StackPanel>
                     <TextBlock x:Name="HeaderText" FontSize="18" FontWeight="SemiBold" />
@@ -106,7 +108,7 @@
                 <Button Content="פתח" Click="Open_Click" />
                 <Button Content="שנה שם" Click="Rename_Click" ToolTip="F2" />
                 <Button Content="מחק" Click="Delete_Click" ToolTip="מחיקת הפריטים שנבחרו" />
-                <Button Content="☑ בחר הכל" Click="SelectAll_Click" ToolTip="Ctrl+A. אפשר גם לסמן כמה פריטים בתיבות הסימון שליד השמות" />
+                <Button Content="☑ בחר הכל" Click="SelectAll_Click" ToolTip="סימון כל הפריטים. אפשר גם לסמן כמה פריטים בתיבות הסימון שליד השמות, או בגרירה עם העכבר" />
                 <Button x:Name="SavedBtn" Content="★ שמורים" Click="Saved_Click" ToolTip="תיקיות וקבצים ששמרת במכשיר הזה" />
             </WrapPanel>
             <DockPanel DockPanel.Dock="Top" Margin="3,6,3,6">

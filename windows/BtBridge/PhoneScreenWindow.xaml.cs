@@ -161,6 +161,12 @@ public partial class PhoneScreenWindow : Window
     private void Quick_Click(object sender, RoutedEventArgs e) => Global("quick");
     private void Lock_Click(object sender, RoutedEventArgs e) => Global("lock");
 
+    private void Apps_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_s.Has("launch")) { MainWindow.Err(new RemoteException("unsupported", "בטלפון מותקנת גרסה ישנה. עדכן אותו.")); return; }
+        new PhoneAppsWindow(_s) { Owner = this }.ShowDialog();
+    }
+
     private void Profile_Changed(object sender, SelectionChangedEventArgs e)
     {
         // Also fires while the window loads, before the stream (and even the named controls) exist.

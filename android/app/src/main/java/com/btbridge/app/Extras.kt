@@ -126,14 +126,81 @@ class BridgeNotifications : NotificationListenerService() {
             val app = runCatching {
                 packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
             }.getOrDefault(sbn.packageName)
-            App.bridge.runInBackground { App.bridge.forwardNotification(app, title, text) }
+            val canReply = replyAction(n) != null
+            App.bridge.runInBackground { App.bridge.forwardNotification(app, title, text, sbn.key, canReply) }
         } catch (e: Exception) {
             Log.w("notification: ${e.message}")
         }
     }
 
+    override fun onListenerConnected() { instance = this }
+    override fun onListenerDisconnected() { if (instance === this) instance = null }
+    override fun onDestroy() { if (instance === this) instance = null; super.onDestroy() }
+
     companion object {
+        @Volatile private var instance: BridgeNotifications? = null
+
         fun isEnabled(ctx: Context) = ctx.packageName in NotificationManagerCompat.getEnabledListenerPackages(ctx)
+
+        /** The "reply" button of a notification (a messaging app's), if it has one. */
+        private fun replyAction(n: Notification): Notification.Action? =
+            n.actions?.firstOrNull { a -> a.remoteInputs?.any { it.allowFreeFormInput } == true }
+
+        private fun find(key: String): StatusBarNotification {
+            val svc = instance ?: throw com.btbridge.app.core.RemoteException("denied", "אין לגשר בלוטוס גישה להתראות בטלפון")
+            return svc.activeNotifications?.firstOrNull { it.key == key }
+                ?: throw com.btbridge.app.core.RemoteException("notfound", "ההתראה כבר לא קיימת בטלפון")
+        }
+
+        /** Answers a notification from the computer, the same as typing in its "reply" box on the phone. */
+        fun reply(ctx: Context, key: String, text: String) {
+            val action = replyAction(find(key).notification)
+                ?: throw com.btbridge.app.core.RemoteException("unsupported", "אי אפשר לענות על ההתראה הזו")
+            val results = android.os.Bundle()
+            for (ri in action.remoteInputs) if (ri.allowFreeFormInput) results.putCharSequence(ri.resultKey, text)
+            val intent = Intent()
+            android.app.RemoteInput.addResultsToIntent(action.remoteInputs, intent, results)
+            action.actionIntent.send(ctx, 0, intent)
+        }
+
+        /** Opens what the notification leads to (the chat, the email) on the phone. */
+        fun open(key: String) {
+            val n = find(key).notification
+            (n.contentIntent ?: throw com.btbridge.app.core.RemoteException("unsupported", "ההתראה הזו לא נפתחת")).send()
+        }
+
+        fun dismiss(key: String) {
+            find(key)
+            instance?.cancelNotification(key)
+        }
+    }
+}
+
+/** The phone's apps, for the computer: the list, and opening one (PROTOCOL.md section 4, "apps" and "launch"). */
+object PhoneApps {
+    fun list(ctx: Context): org.json.JSONArray {
+        val pm = ctx.packageManager
+        val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val arr = org.json.JSONArray()
+        pm.queryIntentActivities(main, 0)
+            .map { it.loadLabel(pm).toString() to it.activityInfo.packageName }
+            .distinctBy { it.second }
+            .filter { it.second != ctx.packageName }
+            .sortedBy { it.first.lowercase() }
+            .forEach { (label, pkg) -> arr.put(org.json.JSONObject().put("label", label).put("pkg", pkg)) }
+        return arr
+    }
+
+    /**
+     * Opens an app. Android lets a background app open screens only in some cases; "control from the computer"
+     * (the accessibility service) is one of them, so it is asked for when it is off.
+     */
+    fun launch(ctx: Context, pkg: String) {
+        val intent = ctx.packageManager.getLaunchIntentForPackage(pkg)
+            ?: throw com.btbridge.app.core.RemoteException("notfound", "האפליקציה לא נמצאה בטלפון")
+        if (!BridgeAccessibility.isEnabled(ctx))
+            throw com.btbridge.app.core.RemoteException("denied", "כדי לפתוח אפליקציות מהמחשב, הפעל בטלפון: הגדרות ← נגישות ← גשר בלוטוס")
+        ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 }
 
