@@ -178,9 +178,12 @@ class Bridge(private val ctx: Context) : RequestHandler {
         wifi.announce(s)
     }
 
+    /** The "send to a device without the app" screen is using the hotspot: it stays open while that screen is shown. */
+    @Volatile var hotspotKeptOpen = false
+
     /** 90 seconds without transfers or screen sharing: close the hotspot, and tell the computers to go back. */
     private fun closeIdleHotspot() {
-        if (!hotspot.active) return
+        if (!hotspot.active || hotspotKeptOpen) return
         val now = System.currentTimeMillis()
         val busy = sessions.value.any { it.hasActiveStreams || now - it.lastDataActivity < 90_000 } ||
             transfers.value.any { it.active }

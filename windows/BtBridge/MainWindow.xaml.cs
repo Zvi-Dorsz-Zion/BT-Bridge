@@ -338,6 +338,8 @@ public partial class MainWindow : Window
         await LoadPaired();
     }
 
+    private void NoAppSend_Click(object sender, RoutedEventArgs e) => new NoAppSendWindow { Owner = this }.Show();
+
     private async void PairNew_Click(object sender, RoutedEventArgs e)
     {
         var w = new PairWindow { Owner = this };

@@ -42,6 +42,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
@@ -146,6 +147,7 @@ private sealed interface Screen {
     data object Transfers : Screen
     data object Settings : Screen
     data object Scan : Screen
+    data object NoAppSend : Screen
 }
 
 @Composable
@@ -161,7 +163,8 @@ private fun AppRoot(resumed: Int) {
 
     when (val s = screen) {
         Screen.Home -> HomeScreen(resumed, onOpen = { screen = Screen.Explorer(it.peerFp) },
-            onTransfers = { screen = Screen.Transfers }, onSettings = { screen = Screen.Settings }, onScan = { screen = Screen.Scan })
+            onTransfers = { screen = Screen.Transfers }, onSettings = { screen = Screen.Settings }, onScan = { screen = Screen.Scan },
+            onNoApp = { screen = Screen.NoAppSend })
         is Screen.Explorer -> {
             val session = sessions.firstOrNull { it.peerFp == s.fp }
             if (session == null) LaunchedEffect(Unit) { screen = Screen.Home }
@@ -181,6 +184,7 @@ private fun AppRoot(resumed: Int) {
         Screen.Transfers -> TransfersScreen(onBack = { screen = Screen.Home })
         Screen.Settings -> SettingsScreen(resumed, onBack = { screen = Screen.Home })
         Screen.Scan -> ScanScreen(onBack = { screen = Screen.Home }, onConnected = { screen = Screen.Explorer(it.peerFp) })
+        Screen.NoAppSend -> NoAppSendScreen(onBack = { screen = Screen.Home })
     }
     PasswordPrompt()
 }
@@ -248,7 +252,7 @@ private class DeviceRow(val key: String, val fp: String, val name: String, val d
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("MissingPermission")
 @Composable
-private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () -> Unit, onSettings: () -> Unit, onScan: () -> Unit) {
+private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () -> Unit, onSettings: () -> Unit, onScan: () -> Unit, onNoApp: () -> Unit) {
     val b = App.bridge
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -342,6 +346,13 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
         TopAppBar(title = { Text("גשר בלוטוס") }, actions = {
             IconButton(onClick = onTransfers) { Icon(Icons.Filled.SwapVert, "העברות") }
             IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "הגדרות") }
+            var barMenu by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { barMenu = true }) { Icon(Icons.Filled.MoreVert, "עוד") }
+                androidx.compose.material3.DropdownMenu(barMenu, { barMenu = false }) {
+                    androidx.compose.material3.DropdownMenuItem(text = { Text("שלח למכשיר בלי התוכנה") }, onClick = { barMenu = false; onNoApp() })
+                }
+            }
         })
     }) { pad ->
         LazyColumn(Modifier.padding(pad).fillMaxSize()) {

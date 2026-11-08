@@ -55,6 +55,7 @@
                         <Button x:Name="DisconnectBtn" Content="נתק" Click="Disconnect_Click" />
                     </UniformGrid>
                     <Button Content="חפש וצמד מכשיר חדש…" Click="PairNew_Click" />
+                    <Button Content="שלח למכשיר בלי התוכנה…" Click="NoAppSend_Click" ToolTip="שולח קבצים למכשיר שלא מותקן בו גשר בלוטוס: קישור לדפדפן בוויפי, או שליחה רגילה בבלוטוס" />
                     <Button Content="הגדרות" Click="Settings_Click" />
                 </StackPanel>
                 <ListBox x:Name="DeviceList" BorderThickness="0" SelectionChanged="DeviceList_SelectionChanged"

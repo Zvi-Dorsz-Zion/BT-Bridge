@@ -16,8 +16,8 @@ android {
         minSdk = 21
         targetSdk = 34
         // בכל גרסה חדשה להגדיל את versionCode, אחרת הטלפון לא יתקין עדכון
-        versionCode = 12
-        versionName = "0.5.1"
+        versionCode = 13
+        versionName = "0.5.2"
     }
 
     // חתימה קבועה: signing/btbridge.jks + signing/keystore.properties (לגבות! בלי הקובץ אי אפשר להתקין עדכונים)
@@ -82,6 +82,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    // קוד QR למסך "שלח למכשיר בלי התוכנה". גרסה 3.3.3 בכוונה: החדשות דורשות אנדרואיד חדש יותר
+    implementation("com.google.zxing:core:3.3.3")
 
     // בדיקת תאימות מול צד Windows: org.json האמיתי, כי זה של אנדרואיד הוא רק stub ב-JVM
     testImplementation("junit:junit:4.13.2")
