@@ -19,12 +19,16 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BtBridge", "דפדפן");
 
     private readonly Process _proc;
-    private readonly ClientWebSocket _ws = new();
     private readonly CancellationTokenSource _cts = new();
-    private readonly SemaphoreSlim _sendGate = new(1);
-    private readonly Dictionary<int, TaskCompletionSource<JsonObject>> _calls = new();
-    private int _nextCall;
-    private readonly string _targetId;
+    private Conn _browser = null!;
+    private volatile Conn _active = null!;
+    private readonly List<Conn> _tabs = new();
+    private readonly HashSet<string> _attaching = new();
+    private string _lastTabs = "";
+    private readonly int _port;
+    private readonly string _home;
+    private readonly bool _withTabs;
+    private string _userAgent = "";
     private readonly int _vw, _vh;
     private byte[]? _frame;
     private readonly object _frameGate = new();
@@ -44,12 +48,17 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
     /// <summary>The page address and title changed (sent to the viewer, to show in its address bar).</summary>
     public event Action<string, string>? PageChanged;
 
+    /// <summary>The list of tabs changed: [{id, title, url, active}] (sent to the viewer).</summary>
+    public event Action<JsonArray>? TabsChanged;
+
     public string Url { get; private set; } = "";
 
-    private RemoteBrowser(Process proc, string targetId, int vw, int vh, string profile, bool touch)
+    private RemoteBrowser(Process proc, int port, string home, bool withTabs, int vw, int vh, string profile, bool touch)
     {
         _proc = proc;
-        _targetId = targetId;
+        _port = port;
+        _home = home;
+        _withTabs = withTabs;
         _vw = vw;
         _vh = vh;
         _profile = profile;
@@ -92,8 +101,9 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
     /// <summary>
     /// Starts the browser with a page of <paramref name="vw"/>×<paramref name="vh"/> (in page pixels, like a phone).
     /// <paramref name="touch"/>: the viewer sends touches (a finger drag scrolls the page, as on a phone) instead of mouse events.
+    /// <paramref name="withTabs"/>: the viewer can show several tabs; otherwise a link to a new tab opens in the same one.
     /// </summary>
-    public static async Task<RemoteBrowser> StartAsync(string prefer, string downloadDir, string startUrl, int vw, int vh, bool touch = false)
+    public static async Task<RemoteBrowser> StartAsync(string prefer, string downloadDir, string startUrl, int vw, int vh, bool touch = false, bool withTabs = false)
     {
         var exe = FindBrowser(prefer) ?? throw new RemoteException("notfound", "לא נמצא במחשב דפדפן אדג' או כרום");
         // The browser that was just closed takes a few seconds to let go of the usual profile (with the user's logins):
@@ -104,11 +114,11 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
             await Task.Delay(200);
         }
         var profileDir = TakeProfile();
-        try { return await StartIn(profileDir, exe, downloadDir, startUrl, vw, vh, touch); }
+        try { return await StartIn(profileDir, exe, downloadDir, startUrl, vw, vh, touch, withTabs); }
         catch { FreeProfile(profileDir); throw; }
     }
 
-    private static async Task<RemoteBrowser> StartIn(string profileDir, string exe, string downloadDir, string startUrl, int vw, int vh, bool touch)
+    private static async Task<RemoteBrowser> StartIn(string profileDir, string exe, string downloadDir, string startUrl, int vw, int vh, bool touch, bool withTabs)
     {
         Directory.CreateDirectory(profileDir);
         var portFile = Path.Combine(profileDir, "DevToolsActivePort");
@@ -158,27 +168,16 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
                 if (page == null) await Task.Delay(200);
             }
             if (page == null) throw new IOException("לא נמצא דף בדפדפן");
-            var b = new RemoteBrowser(proc, page["id"]!.GetValue<string>(), vw, vh, profileDir, touch);
-            await b._ws.ConnectAsync(new Uri(page["webSocketDebuggerUrl"]!.GetValue<string>()), CancellationToken.None);
-            _ = b.ReadLoop();
-            await b.Call("Page.enable");
-            await b.Call("Target.setDiscoverTargets", new JsonObject { ["discover"] = true });
-            await b.Call("Emulation.setDeviceMetricsOverride", new JsonObject
-            {
-                ["width"] = vw, ["height"] = vh, ["deviceScaleFactor"] = Scale, ["mobile"] = true,
-            });
-            // Pages see a touch screen, as on a phone (some sites only answer touches).
-            if (touch) await b.Call("Emulation.setTouchEmulationEnabled", new JsonObject { ["enabled"] = true, ["maxTouchPoints"] = 1 });
-            // Without the word "Headless" sites treat it as an ordinary browser.
-            var ver = await b.Call("Browser.getVersion");
-            var ua = ver["userAgent"]?.GetValue<string>()?.Replace("HeadlessChrome", "Chrome") ?? "";
-            if (ua.Length > 0) await b.Call("Emulation.setUserAgentOverride", new JsonObject { ["userAgent"] = ua });
+            var b = new RemoteBrowser(proc, port, startUrl, withTabs, vw, vh, profileDir, touch);
+            var ver = JsonNode.Parse(await http.GetStringAsync($"http://127.0.0.1:{port}/json/version")) as JsonObject
+                ?? throw new IOException("הדפדפן לא ענה");
+            b._browser = new Conn("", b._cts.Token, b.OnBrowserEvent);
+            await b._browser.Connect(ver["webSocketDebuggerUrl"]!.GetValue<string>());
+            b._userAgent = ver["User-Agent"]?.GetValue<string>()?.Replace("HeadlessChrome", "Chrome") ?? "";
+            await b._browser.Call("Target.setDiscoverTargets", new JsonObject { ["discover"] = true });
             Directory.CreateDirectory(downloadDir);
-            await b.Call("Browser.setDownloadBehavior", new JsonObject { ["behavior"] = "allow", ["downloadPath"] = downloadDir });
-            await b.Call("Page.startScreencast", new JsonObject
-            {
-                ["format"] = "jpeg", ["quality"] = 85, ["maxWidth"] = vw * Scale, ["maxHeight"] = vh * Scale,
-            });
+            await b._browser.Call("Browser.setDownloadBehavior", new JsonObject { ["behavior"] = "allow", ["downloadPath"] = downloadDir });
+            b.Select(await b.AttachTab(page["id"]!.GetValue<string>()));
             return b;
         }
         catch
@@ -190,101 +189,297 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
 
     // ---------------------------------------------------------------- the remote control interface
 
-    private async Task<JsonObject> Call(string method, JsonObject? args = null)
+    /// <summary>One connection to the browser's control interface: to the browser itself, or to one tab.</summary>
+    private sealed class Conn(string id, CancellationToken stop, Action<Conn, string, JsonObject> onEvent)
     {
-        var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
-        int id;
-        lock (_calls) { id = ++_nextCall; _calls[id] = tcs; }
-        await Send(new JsonObject { ["id"] = id, ["method"] = method, ["params"] = args ?? new JsonObject() }).ConfigureAwait(false);
-        var res = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
-        if (res["error"] is JsonObject err) throw new IOException("הדפדפן: " + err["message"]?.GetValue<string>());
-        return res["result"] as JsonObject ?? new JsonObject();
-    }
+        public string Id { get; } = id;
+        public string Url = "", Title = "";
+        private readonly ClientWebSocket _ws = new();
+        private readonly SemaphoreSlim _gate = new(1);
+        private readonly Dictionary<int, TaskCompletionSource<JsonObject>> _calls = new();
+        private int _next;
 
-    private void Fire(string method, JsonObject? args = null) => _ = Send(new JsonObject
-    {
-        ["id"] = Interlocked.Increment(ref _nextCall), ["method"] = method, ["params"] = args ?? new JsonObject(),
-    });
-
-    private async Task Send(JsonObject msg)
-    {
-        var bytes = Encoding.UTF8.GetBytes(msg.ToJsonString());
-        await _sendGate.WaitAsync().ConfigureAwait(false);
-        try { await _ws.SendAsync(bytes, WebSocketMessageType.Text, true, _cts.Token).ConfigureAwait(false); }
-        catch (Exception ex) { Log.Write("browser send: " + ex.Message); }
-        finally { _sendGate.Release(); }
-    }
-
-    private async Task ReadLoop()
-    {
-        var buf = new byte[1 << 20];
-        var msg = new MemoryStream();
-        try
+        public async Task Connect(string url)
         {
-            while (_ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+            await _ws.ConnectAsync(new Uri(url), CancellationToken.None).ConfigureAwait(false);
+            _ = ReadLoop();
+        }
+
+        public async Task<JsonObject> Call(string method, JsonObject? args = null)
+        {
+            var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+            int id;
+            lock (_calls) { id = ++_next; _calls[id] = tcs; }
+            await Send(new JsonObject { ["id"] = id, ["method"] = method, ["params"] = args ?? new JsonObject() }).ConfigureAwait(false);
+            var res = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+            if (res["error"] is JsonObject err) throw new IOException("הדפדפן: " + err["message"]?.GetValue<string>());
+            return res["result"] as JsonObject ?? new JsonObject();
+        }
+
+        public void Fire(string method, JsonObject? args = null) => _ = Send(new JsonObject
+        {
+            ["id"] = Interlocked.Increment(ref _next), ["method"] = method, ["params"] = args ?? new JsonObject(),
+        });
+
+        public async Task Send(JsonObject msg)
+        {
+            var bytes = Encoding.UTF8.GetBytes(msg.ToJsonString());
+            await _gate.WaitAsync().ConfigureAwait(false);
+            try { await _ws.SendAsync(bytes, WebSocketMessageType.Text, true, stop).ConfigureAwait(false); }
+            catch (Exception ex) { if (!stop.IsCancellationRequested) Log.Write("browser send: " + ex.Message); }
+            finally { _gate.Release(); }
+        }
+
+        public int NextId() => Interlocked.Increment(ref _next);
+
+        public async Task<string> Eval(string expr)
+        {
+            var r = await Call("Runtime.evaluate", new JsonObject { ["expression"] = expr, ["returnByValue"] = true }).ConfigureAwait(false);
+            return r["result"]?["value"]?.ToString() ?? "";
+        }
+
+        private async Task ReadLoop()
+        {
+            var buf = new byte[1 << 20];
+            var msg = new MemoryStream();
+            try
             {
-                var r = await _ws.ReceiveAsync(buf, _cts.Token);
-                if (r.MessageType == WebSocketMessageType.Close) break;
-                msg.Write(buf, 0, r.Count);
-                if (!r.EndOfMessage) continue;
-                var o = JsonNode.Parse(msg.GetBuffer().AsSpan(0, (int)msg.Length)) as JsonObject;
-                msg.SetLength(0);
-                if (o != null) Handle(o);
+                while (_ws.State == WebSocketState.Open && !stop.IsCancellationRequested)
+                {
+                    var r = await _ws.ReceiveAsync(buf, stop).ConfigureAwait(false);
+                    if (r.MessageType == WebSocketMessageType.Close) break;
+                    msg.Write(buf, 0, r.Count);
+                    if (!r.EndOfMessage) continue;
+                    var o = JsonNode.Parse(msg.GetBuffer().AsSpan(0, (int)msg.Length)) as JsonObject;
+                    msg.SetLength(0);
+                    if (o == null) continue;
+                    if (o["id"] is JsonNode idNode)
+                    {
+                        TaskCompletionSource<JsonObject>? tcs;
+                        lock (_calls) _calls.Remove(idNode.GetValue<int>(), out tcs);
+                        tcs?.TrySetResult(o);
+                    }
+                    else if (o["method"]?.GetValue<string>() is { } method)
+                    {
+                        // One bad event must not end the connection.
+                        try { onEvent(this, method, o["params"] as JsonObject ?? new JsonObject()); }
+                        catch (Exception ex) { Log.Write("browser event: " + ex.Message); }
+                    }
+                }
+            }
+            catch (Exception ex) { if (!stop.IsCancellationRequested) Log.Write("browser read: " + ex.Message); }
+        }
+
+        public void Close()
+        {
+            try { _ws.Dispose(); } catch { }
+        }
+    }
+
+    private Task<JsonObject> Call(string method, JsonObject? args = null) => _active.Call(method, args);
+    private void Fire(string method, JsonObject? args = null) => _active.Fire(method, args);
+
+    // ---------------------------------------------------------------- tabs
+
+    /// <summary>More than this only uses up the computer's memory: every open tab keeps running.</summary>
+    private const int MaxTabs = 12;
+
+    /// <summary>Connects to a tab and gives it the phone's size and identity.</summary>
+    private async Task<Conn> AttachTab(string id)
+    {
+        var c = new Conn(id, _cts.Token, OnTabEvent);
+        await c.Connect($"ws://127.0.0.1:{_port}/devtools/page/{id}").ConfigureAwait(false);
+        await c.Call("Page.enable").ConfigureAwait(false);
+        await c.Call("Emulation.setDeviceMetricsOverride", new JsonObject
+        {
+            ["width"] = _vw, ["height"] = _vh, ["deviceScaleFactor"] = Scale, ["mobile"] = true,
+        }).ConfigureAwait(false);
+        // Pages see a touch screen, as on a phone (some sites only answer touches).
+        if (_touch) await c.Call("Emulation.setTouchEmulationEnabled", new JsonObject { ["enabled"] = true, ["maxTouchPoints"] = 1 }).ConfigureAwait(false);
+        // Without the word "Headless" sites treat it as an ordinary browser.
+        if (_userAgent.Length > 0) await c.Call("Emulation.setUserAgentOverride", new JsonObject { ["userAgent"] = _userAgent }).ConfigureAwait(false);
+        lock (_tabs) _tabs.Add(c);
+        return c;
+    }
+
+    /// <summary>Shows this tab. Only the shown tab sends pictures; the others keep running without using the link.</summary>
+    private void Select(Conn c)
+    {
+        var old = _active;
+        if (old != null && old != c) old.Fire("Page.stopScreencast");
+        _active = c;
+        c.Fire("Page.bringToFront");
+        c.Fire("Page.startScreencast", new JsonObject
+        {
+            ["format"] = "jpeg", ["quality"] = 85, ["maxWidth"] = _vw * Scale, ["maxHeight"] = _vh * Scale,
+        });
+        Url = c.Url;
+        PageChanged?.Invoke(c.Url, c.Title);
+        PushTabs();
+    }
+
+    /// <summary>A new tab, shown at once, with an address or the browser's first page.</summary>
+    private async Task NewTab(string? url)
+    {
+        lock (_tabs) if (_tabs.Count >= MaxTabs) return;
+        var r = await _browser.Call("Target.createTarget", new JsonObject { ["url"] = "about:blank" }).ConfigureAwait(false);
+        var id = r["targetId"]!.GetValue<string>();
+        var c = await AttachTab(id).ConfigureAwait(false);
+        Select(c);
+        c.Fire("Page.navigate", new JsonObject { ["url"] = string.IsNullOrWhiteSpace(url) ? _home : ToAddress(url) });
+    }
+
+    private async Task CloseTab(string id)
+    {
+        bool last;
+        lock (_tabs) last = _tabs.Count == 1 && _tabs[0].Id == id;
+        // The browser would end with its last tab: a fresh one comes first.
+        if (last) await NewTab(null).ConfigureAwait(false);
+        _browser.Fire("Target.closeTarget", new JsonObject { ["targetId"] = id });
+    }
+
+    private void SelectTab(string id)
+    {
+        Conn? c;
+        lock (_tabs) c = _tabs.FirstOrDefault(x => x.Id == id);
+        if (c != null && c != _active) Select(c);
+    }
+
+    /// <summary>Tells the viewer the list of tabs (only when something in it changed).</summary>
+    public void PushTabs(bool force = false)
+    {
+        var arr = new JsonArray();
+        lock (_tabs)
+            foreach (var c in _tabs)
+                arr.Add(new JsonObject
+                {
+                    ["id"] = c.Id,
+                    ["title"] = c.Title.Length > 60 ? c.Title[..60] : c.Title,
+                    ["url"] = c.Url.Length > 120 ? c.Url[..120] : c.Url,
+                    ["active"] = c == _active,
+                });
+        var text = arr.ToJsonString();
+        lock (_tabs)
+        {
+            if (!force && text == _lastTabs) return;
+            _lastTabs = text;
+        }
+        TabsChanged?.Invoke(arr);
+    }
+
+    private void OnBrowserEvent(Conn self, string method, JsonObject p)
+    {
+        switch (method)
+        {
+            case "Target.targetCreated" or "Target.targetInfoChanged":
+            {
+                if (p["targetInfo"] is not JsonObject info || info["type"]?.GetValue<string>() != "page") return;
+                var id = info["targetId"]?.GetValue<string>() ?? "";
+                var url = info["url"]?.GetValue<string>() ?? "";
+                var title = info["title"]?.GetValue<string>() ?? "";
+                Conn? known;
+                lock (_tabs) known = _tabs.FirstOrDefault(x => x.Id == id);
+                if (known != null)
+                {
+                    known.Url = url;
+                    known.Title = title;
+                    if (known == _active)
+                    {
+                        Url = url;
+                        PageChanged?.Invoke(url, title);
+                    }
+                    PushTabs();
+                    return;
+                }
+                // Opened by a page we control: a link to a new tab.
+                var opener = info["openerId"]?.GetValue<string>();
+                bool ours;
+                lock (_tabs) ours = opener != null && _tabs.Any(x => x.Id == opener);
+                if (!ours || info["subtype"] != null) return;
+                if (!_withTabs)
+                {
+                    // The viewer shows one page only: it opens here instead.
+                    if (url.Length == 0 || url == "about:blank") return;
+                    _browser.Fire("Target.closeTarget", new JsonObject { ["targetId"] = id });
+                    Fire("Page.navigate", new JsonObject { ["url"] = url });
+                    return;
+                }
+                lock (_tabs)
+                {
+                    if (!_attaching.Add(id)) return;
+                    if (_tabs.Count >= MaxTabs)
+                    {
+                        // Too many tabs: this link opens in the tab being shown.
+                        if (url.Length == 0 || url == "about:blank") { _attaching.Remove(id); return; }
+                        _browser.Fire("Target.closeTarget", new JsonObject { ["targetId"] = id });
+                        Fire("Page.navigate", new JsonObject { ["url"] = url });
+                        return;
+                    }
+                }
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var c = await AttachTab(id).ConfigureAwait(false);
+                        c.Url = url;
+                        Select(c);
+                        // It started loading before it got the phone's size and identity.
+                        if (url.Length > 0 && url != "about:blank") c.Fire("Page.reload");
+                    }
+                    catch (Exception ex) { Log.Write("browser tab: " + ex.Message); }
+                    finally { lock (_tabs) _attaching.Remove(id); }
+                });
+                break;
+            }
+            case "Target.targetDestroyed":
+            {
+                var id = p["targetId"]?.GetValue<string>() ?? "";
+                Conn? gone, next = null;
+                lock (_tabs)
+                {
+                    gone = _tabs.FirstOrDefault(x => x.Id == id);
+                    if (gone == null) return;
+                    int at = _tabs.IndexOf(gone);
+                    _tabs.RemoveAt(at);
+                    if (gone == _active && _tabs.Count > 0) next = _tabs[Math.Min(at, _tabs.Count - 1)];
+                }
+                gone.Close();
+                if (next != null) Select(next);
+                else PushTabs();
+                break;
             }
         }
-        catch (Exception ex) { if (!_cts.IsCancellationRequested) Log.Write("browser read: " + ex.Message); }
     }
 
-    private void Handle(JsonObject o)
+    private void OnTabEvent(Conn c, string method, JsonObject p)
     {
-        if (o["id"] is JsonNode idNode)
-        {
-            TaskCompletionSource<JsonObject>? tcs;
-            lock (_calls) { if (_calls.Remove(idNode.GetValue<int>(), out tcs)) { } }
-            tcs?.TrySetResult(o);
-            return;
-        }
-        var p = o["params"] as JsonObject;
-        switch (o["method"]?.GetValue<string>())
+        switch (method)
         {
             case "Page.screencastFrame":
-                lock (_frameGate) _frame = Convert.FromBase64String(p!["data"]!.GetValue<string>());
+                c.Fire("Page.screencastFrameAck", new JsonObject { ["sessionId"] = p["sessionId"]!.GetValue<int>() });
+                if (c != _active) return;
+                lock (_frameGate) _frame = Convert.FromBase64String(p["data"]!.GetValue<string>());
                 // How much the page is shrunk in this picture (a site without a phone layout: for example 0.3).
                 if (p["metadata"]?["pageScaleFactor"] is JsonNode psf && psf.GetValue<double>() is > 0 and var k) _pageScale = k;
-                Fire("Page.screencastFrameAck", new JsonObject { ["sessionId"] = p["sessionId"]!.GetValue<int>() });
                 break;
             case "Page.javascriptDialogOpening":
                 // A page message ("are you sure?"): accepted, so the page doesn't stay stuck where nobody can answer it.
-                Fire("Page.handleJavaScriptDialog", new JsonObject { ["accept"] = true });
+                c.Fire("Page.handleJavaScriptDialog", new JsonObject { ["accept"] = true });
                 break;
-            case "Target.targetCreated" or "Target.targetInfoChanged":
-            {
-                var info = p!["targetInfo"] as JsonObject;
-                var id = info?["targetId"]?.GetValue<string>();
-                var url = info?["url"]?.GetValue<string>() ?? "";
-                if (id == _targetId)
-                {
-                    Url = url;
-                    PageChanged?.Invoke(url, info!["title"]?.GetValue<string>() ?? "");
-                }
-                else if (info?["type"]?.GetValue<string>() == "page" && info["openerId"]?.GetValue<string>() == _targetId
-                         && url.Length > 0 && url != "about:blank")
-                {
-                    // A link that opens a new tab: there is only one view, so it opens here instead.
-                    Fire("Target.closeTarget", new JsonObject { ["targetId"] = id });
-                    Fire("Page.navigate", new JsonObject { ["url"] = url });
-                }
-                break;
-            }
             case "Page.loadEventFired" or "Page.navigatedWithinDocument":
                 // The address bar on the phone: the page's current address and title.
                 _ = Task.Run(async () =>
                 {
                     try
                     {
-                        var url = await Eval("location.href");
-                        Url = url;
-                        PageChanged?.Invoke(url, await Eval("document.title"));
+                        c.Url = await c.Eval("location.href").ConfigureAwait(false);
+                        c.Title = await c.Eval("document.title").ConfigureAwait(false);
+                        if (c == _active)
+                        {
+                            Url = c.Url;
+                            PageChanged?.Invoke(c.Url, c.Title);
+                        }
+                        PushTabs();
                     }
                     catch { }
                 });
@@ -332,6 +527,24 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
 
     public void Input(JsonObject ev, MonitorInfo mon, int x, int y, bool restoreCursor)
     {
+        // Tabs (PROTOCOL.md section 7). In the background: this runs on the link's reader, and these wait for the browser.
+        if (ev["t"]?.GetValue<string>() is "tab-new" or "tab-select" or "tab-close")
+        {
+            var what = ev["t"]!.GetValue<string>();
+            var tab = ev["tab"]?.GetValue<string>() ?? "";
+            var url = ev["url"]?.GetValue<string>();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    if (what == "tab-new") await NewTab(url);
+                    else if (what == "tab-select") SelectTab(tab);
+                    else await CloseTab(tab);
+                }
+                catch (Exception ex) { Log.Write("browser tab: " + ex.Message); }
+            });
+            return;
+        }
         // Picture pixels → page pixels. The browser takes page pixels of the page's own layout, so on a page shown shrunk
         // (page scale below 1) a tap must be divided by that too, or it lands up and to the left of the finger.
         double k = _pageScale;
@@ -392,11 +605,16 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
     {
         text = text.Trim();
         if (text.Length == 0) return;
+        Fire("Page.navigate", new JsonObject { ["url"] = ToAddress(text) });
+    }
+
+    private static string ToAddress(string text)
+    {
+        text = text.Trim();
         bool hasScheme = System.Text.RegularExpressions.Regex.IsMatch(text, @"^(https?|ftp|file|data|about|blob):", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        string url = hasScheme ? text
+        return hasScheme ? text
             : !text.Contains(' ') && text.Contains('.') ? "https://" + text
             : "https://www.google.com/search?q=" + Uri.EscapeDataString(text);
-        Fire("Page.navigate", new JsonObject { ["url"] = url });
     }
 
     private void Touch(string t, int x, int y, int taps)
@@ -468,7 +686,7 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
 
     public void Dispose()
     {
-        lock (_calls)
+        lock (_tabs)
         {
             if (_disposed) return;
             _disposed = true;
@@ -477,11 +695,12 @@ public sealed class RemoteBrowser : IScreenGrabber, IInputSink, IDisposable
         // freeze for the seconds the browser takes to close.
         var closing = Task.Run(() =>
         {
-            try { Send(new JsonObject { ["id"] = Interlocked.Increment(ref _nextCall), ["method"] = "Browser.close" }).Wait(1000); } catch { }
+            try { _browser.Send(new JsonObject { ["id"] = _browser.NextId(), ["method"] = "Browser.close" }).Wait(1000); } catch { }
             // Let it finish by itself: closing is when it writes its cookies, so forcing it can lose a login.
             try { if (!_proc.WaitForExit(10_000)) { Log.Write("browser: did not close in time, forcing"); _proc.Kill(true); } } catch { }
             _cts.Cancel();
-            try { _ws.Dispose(); } catch { }
+            lock (_tabs) { foreach (var c in _tabs) c.Close(); }
+            _browser.Close();
             FreeProfile(_profile);
         });
         lock (Closing) Closing.Add(closing);

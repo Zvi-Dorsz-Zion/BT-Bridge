@@ -223,6 +223,7 @@ static class AppTests
         finally { b.Dispose(); }
         RemoteBrowser.WaitClosed(TimeSpan.FromSeconds(15));
         fails += await RunBrowserKeepsLogin(prefer);
+        fails += await RunBrowserTabs(prefer);
         fails += await RunBrowserTouch(prefer);
         fails += await RunBrowserShrunk(prefer, touch: true);
         fails += await RunBrowserShrunk(prefer, touch: false);
@@ -307,6 +308,79 @@ static class AppTests
             if (!ok) fails++;
         }
         finally { b.Dispose(); }
+        return fails;
+    }
+
+    /// <summary>Tabs (0.5.1): a new tab, a link that opens one, switching between them, and closing.</summary>
+    private static async Task<int> RunBrowserTabs(string prefer)
+    {
+        // A small real site for the link (browsers refuse links that open "data:" pages in a new tab).
+        var site = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        site.Start();
+        int sitePort = ((System.Net.IPEndPoint)site.LocalEndpoint).Port;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    using var c = await site.AcceptTcpClientAsync();
+                    var st = c.GetStream();
+                    await st.ReadAsync(new byte[4096]);
+                    var body = "<title>linked</title>";
+                    await st.WriteAsync(System.Text.Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + body.Length + "\r\nConnection: close\r\n\r\n" + body));
+                }
+            }
+            catch { }
+        });
+        string first = $"<title>one</title><a id=a target=_blank style='position:absolute;left:0;top:0;width:300px;height:200px;display:block' href=\"http://127.0.0.1:{sitePort}/\">x</a>";
+        const string meta = "<meta name=viewport content='width=device-width,initial-scale=1'>";
+        var dir = Path.Combine(Path.GetTempPath(), "btb-browser-test");
+        RemoteBrowser b;
+        try { b = await RemoteBrowser.StartAsync(prefer, dir, "data:text/html," + Uri.EscapeDataString(meta + first), 400, 700, withTabs: true); }
+        catch (Exception ex) { Console.WriteLine("TABS START FAILED " + ex.Message); return 1; }
+        int fails = 0;
+        void Check(string name, bool ok) { Console.WriteLine($"{name} {(ok ? "ok" : "FAILED")}"); if (!ok) fails++; }
+        JsonArray tabs = new();
+        b.TabsChanged += a => tabs = a;
+        try
+        {
+            var mon = b.Monitors()[0];
+            bool Wait(Func<bool> f) { for (int i = 0; i < 80 && !f(); i++) Thread.Sleep(100); return f(); }
+            string Title() { try { return b.Eval("document.title").Result; } catch { return ""; } }
+            string Active() => tabs.OfType<JsonNode>().Where(t => t["active"]!.GetValue<bool>()).Select(t => t["id"]!.GetValue<string>()).FirstOrDefault() ?? "";
+            Wait(() => Title() == "one");
+            b.PushTabs(force: true);
+            Wait(() => tabs.Count == 1);
+            var firstId = Active();
+            Check("TABS-FIRST", tabs.Count == 1 && firstId.Length > 0);
+
+            b.Input(new JsonObject { ["t"] = "tab-new", ["url"] = "data:text/html,<title>two</title>" }, mon, 0, 0, false);
+            Check("TABS-NEW", Wait(() => tabs.Count == 2 && Active() != firstId && Title() == "two"));
+            var second = Active();
+            Check("TABS-PICTURE", Wait(() => b.Grab(0, 100, 175) != null));
+
+            b.Input(new JsonObject { ["t"] = "tab-select", ["tab"] = firstId }, mon, 0, 0, false);
+            Check("TABS-SWITCH", Wait(() => Active() == firstId && Title() == "one"));
+
+            // A link with target=_blank opens a tab of its own, and it is shown.
+            Thread.Sleep(500);
+            b.Input(new JsonObject { ["t"] = "click", ["b"] = 0, ["n"] = 1 }, mon, 200, 200, false);
+            Check("TABS-LINK", Wait(() => tabs.Count == 3 && Title() == "linked"));
+
+            b.Input(new JsonObject { ["t"] = "tab-close", ["tab"] = second }, mon, 0, 0, false);
+            Check("TABS-CLOSE", Wait(() => tabs.Count == 2 && tabs.OfType<JsonNode>().All(t => t["id"]!.GetValue<string>() != second)));
+
+            // Closing the last one leaves a fresh tab, not a dead browser.
+            foreach (var id in tabs.OfType<JsonNode>().Select(t => t["id"]!.GetValue<string>()).ToList())
+            {
+                b.Input(new JsonObject { ["t"] = "tab-close", ["tab"] = id }, mon, 0, 0, false);
+                Thread.Sleep(1200);
+            }
+            Check("TABS-LAST", Wait(() => tabs.Count == 1 && Active().Length > 0));
+        }
+        finally { b.Dispose(); }
+        RemoteBrowser.WaitClosed(TimeSpan.FromSeconds(15));
         return fails;
     }
 

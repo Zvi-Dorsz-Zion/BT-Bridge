@@ -360,9 +360,10 @@ public sealed class Bridge : IRequestHandler
                     // A separate browser that only the other device sees (PROTOCOL.md section 7).
                     int vw = Math.Clamp(req["vw"]?.GetValue<int>() ?? 412, 320, 1600), vh = Math.Clamp(req["vh"]?.GetValue<int>() ?? 860, 400, 2400);
                     var b = await RemoteBrowser.StartAsync(Settings.Browser, Settings.DownloadDir, Settings.BrowserHome, vw, vh,
-                        touch: req["touch"]?.GetValue<bool>() == true);
+                        touch: req["touch"]?.GetValue<bool>() == true, withTabs: req["tabs"]?.GetValue<bool>() == true);
                     src = new ScreenSource(s, id, b, b, Codec, req) { Program = "דפדפן נפרד", Owned = b };
                     b.PageChanged += (url, title) => src.Info(new JsonObject { ["url"] = url, ["title"] = title });
+                    b.TabsChanged += tabs => src.Info(new JsonObject { ["tabs"] = tabs });
                     mode = "browser";
                 }
                 else if (req["window"] is JsonNode wn)
@@ -382,6 +383,7 @@ public sealed class Bridge : IRequestHandler
                     mons.Add(new JsonObject { ["i"] = m.Index, ["name"] = m.Name, ["w"] = m.W, ["h"] = m.H, ["primary"] = m.Primary });
                 s.Reply(id, new JsonObject { ["ok"] = true, ["kind"] = "windows", ["monitors"] = mons, ["mode"] = mode });
                 src.Start();
+                (src.Owned as RemoteBrowser)?.PushTabs(force: true); // the viewer is listening only now
                 Notice?.Invoke(src.IsFullScreen ? $"{DisplayName(s)} צופה במסך ושולט בו" : $"{DisplayName(s)} שולט ב: {src.Program}");
                 return null;
             }

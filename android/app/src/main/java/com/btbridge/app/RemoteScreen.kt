@@ -34,6 +34,9 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.Tab
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.ExpandLess
@@ -105,6 +108,9 @@ private val keys = listOf(
     "רענון" to ("f5" to emptyList()), "צילום מסך" to ("prtsc" to emptyList()),
 )
 
+/** A tab of the separate browser, as the computer reports it. */
+data class BrowserTab(val id: String, val title: String, val url: String, val active: Boolean)
+
 /** One program's window on the computer ([window]), or the separate browser ([browser]). */
 data class RemoteTarget(val title: String, val window: Long? = null, val browser: Boolean = false)
 
@@ -142,6 +148,8 @@ fun RemoteScreen(s: Session, target: RemoteTarget?, onClose: () -> Unit) {
     var pageUrl by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
     var addressFocused by remember { mutableStateOf(false) }
+    /** The separate browser's tabs, as the computer reports them. */
+    var tabs by remember { mutableStateOf(emptyList<BrowserTab>()) }
     var mode by remember { mutableStateOf("") }
     val config = androidx.compose.ui.platform.LocalConfiguration.current
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -216,6 +224,12 @@ fun RemoteScreen(s: Session, target: RemoteTarget?, onClose: () -> Unit) {
                 // The address the user is typing is not replaced under their fingers.
                 ev.optString("url").takeIf { it.isNotEmpty() }?.let { if (pageUrl != it) { pageUrl = it; if (!addressFocused) address = it } }
                 ev.optString("mode").takeIf { it.isNotEmpty() }?.let { mode = it }
+                ev.optJSONArray("tabs")?.let { arr ->
+                    tabs = (0 until arr.length()).map { i ->
+                        val t = arr.getJSONObject(i)
+                        BrowserTab(t.optString("id"), t.optString("title"), t.optString("url"), t.optBoolean("active"))
+                    }
+                }
             }
         }
         try {
@@ -235,6 +249,7 @@ fun RemoteScreen(s: Session, target: RemoteTarget?, onClose: () -> Unit) {
                             val vh = (pageH / density) * (maxOf(vw, 320) / vw.toFloat())
                             put("browser", true).put("vw", vw).put("vh", vh.roundToInt())
                             if (browserTouch) put("touch", true)
+                            if (s.has("tabs")) put("tabs", true)
                         }
                         target?.window != null -> put("window", target.window)
                     }
@@ -320,6 +335,39 @@ fun RemoteScreen(s: Session, target: RemoteTarget?, onClose: () -> Unit) {
                 IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "סגור", tint = Color.White) }
                 // On a narrow phone the buttons scroll sideways; close and hide always stay in view.
                 Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                    // The separate browser's tabs: the number of them, and a list to switch, close or add.
+                    if (isBrowser && s.has("tabs")) Box {
+                        Row(
+                            Modifier.clickable { menu = "tabs" }.padding(horizontal = 10.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Filled.Tab, "כרטיסיות", tint = Color.White)
+                            Text("${maxOf(tabs.size, 1)}", Modifier.padding(start = 4.dp), color = Color.White, fontSize = 13.sp)
+                        }
+                        DropdownMenu(menu == "tabs", { menu = "" }) {
+                            DropdownMenuItem(
+                                text = { Text("כרטיסייה חדשה") },
+                                leadingIcon = { Icon(Icons.Filled.Add, null) },
+                                enabled = tabs.size < 12,
+                                onClick = { menu = ""; client.input("tab-new") },
+                            )
+                            HorizontalDivider()
+                            tabs.forEach { t ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text((if (t.active) "✓ " else "") + t.title.ifBlank { t.url.ifBlank { "כרטיסייה ריקה" } },
+                                            maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                                    },
+                                    trailingIcon = {
+                                        IconButton(onClick = { menu = ""; client.input("tab-close", extra = { put("tab", t.id) }) }) {
+                                            Icon(Icons.Filled.Close, "סגור כרטיסייה")
+                                        }
+                                    },
+                                    onClick = { menu = ""; if (!t.active) client.input("tab-select", extra = { put("tab", t.id) }) },
+                                )
+                            }
+                        }
+                    }
                     IconButton(onClick = {
                         // The phone keyboard was closed some other way: one tap opens it again.
                         val v = keysHolder.view

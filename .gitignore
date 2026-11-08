@@ -9,3 +9,7 @@ android/local.properties
 android/signing/
 *.apk
 *.exe
+
+# Plans stay on this computer: only code goes to GitHub
+תוכנית *.md
+תוכנית.md
