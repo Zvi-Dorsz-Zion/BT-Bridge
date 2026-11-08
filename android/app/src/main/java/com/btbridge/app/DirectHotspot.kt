@@ -6,9 +6,13 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.annotation.RequiresApi
 import com.btbridge.app.core.Log
+import com.btbridge.app.core.Promise
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * Direct network (PROTOCOL.md section 8): a temporary private hotspot (random name and password,
@@ -18,6 +22,15 @@ import java.util.concurrent.TimeUnit
 class DirectHotspot(private val ctx: Context) {
     class Credentials(val ssid: String, val pass: String)
 
+    companion object {
+        /** The temporary private hotspot (LocalOnlyHotspot) exists from Android 8.0. */
+        val supported: Boolean get() = Build.VERSION.SDK_INT >= 26
+    }
+
+    /** While one caller opens the hotspot, a second one waits for the same result instead of opening it again. */
+    private val gate = Any()
+    private var inFlight: Promise<Credentials>? = null
+
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
     @Volatile private var creds: Credentials? = null
@@ -25,10 +38,31 @@ class DirectHotspot(private val ctx: Context) {
     val active: Boolean get() = reservation != null
 
     /** Opens the hotspot (or returns the open one). Blocks up to 20 seconds; throws with a Hebrew message. */
-    @SuppressLint("MissingPermission")
     fun start(): Credentials {
-        creds?.let { if (reservation != null) return it }
-        val wifi = ctx.applicationContext.getSystemService(WifiManager::class.java) ?: error("אין וויפי בטלפון")
+        if (Build.VERSION.SDK_INT < 26) throw IllegalStateException("רשת ישירה דורשת אנדרואיד 8 ומעלה")
+        val (p, mine) = synchronized(gate) {
+            creds?.let { if (reservation != null) return it }
+            inFlight?.let { it to false } ?: (Promise<Credentials>().also { inFlight = it } to true)
+        }
+        if (!mine) {
+            return try { p.get(25, TimeUnit.SECONDS) }
+            catch (e: ExecutionException) { throw e.cause ?: e }
+            catch (e: TimeoutException) { throw IllegalStateException("הנקודה החמה לא נפתחה בזמן") }
+        }
+        try {
+            return startNow().also { p.complete(it) }
+        } catch (e: Exception) {
+            p.completeExceptionally(e)
+            throw e
+        } finally {
+            synchronized(gate) { inFlight = null }
+        }
+    }
+
+    @RequiresApi(26)
+    @SuppressLint("MissingPermission")
+    private fun startNow(): Credentials {
+        val wifi = ctx.applicationContext.service<WifiManager>() ?: error("אין וויפי בטלפון")
         val done = CountDownLatch(1)
         var error: String? = null
         val cb = object : WifiManager.LocalOnlyHotspotCallback() {
@@ -74,10 +108,12 @@ class DirectHotspot(private val ctx: Context) {
         val r = reservation ?: return
         reservation = null
         creds = null
-        runCatching { r.close() }
+        // There is a reservation only on Android 8.0+ (supported).
+        if (Build.VERSION.SDK_INT >= 26) runCatching { r.close() }
         Log.w("direct network closed")
     }
 
+    @RequiresApi(26)
     @Suppress("DEPRECATION")
     private fun read(r: WifiManager.LocalOnlyHotspotReservation): Credentials? =
         if (Build.VERSION.SDK_INT >= 30) {

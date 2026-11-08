@@ -5,7 +5,6 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.CancellationException
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
@@ -38,6 +37,8 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     fun has(cap: String) = cap in peerCaps
     @Volatile var closed = false
         private set
+    /** When the connection was made (monotonic milliseconds), for the "both sides connected at once" rule. */
+    val createdAt: Long = System.nanoTime() / 1_000_000
 
     /** Wi-Fi addresses the other side announced (PROTOCOL.md section 5). */
     @Volatile var peerIps: List<String> = emptyList()
@@ -55,8 +56,8 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     private var bt: Link? = null
     private var wifi: Link? = null
     private val nextId = AtomicLong(if (initiator) -1 else 0)
-    private val pending = ConcurrentHashMap<Int, CompletableFuture<JSONObject>>()
-    private val done = ConcurrentHashMap<Int, CompletableFuture<JSONObject>>()
+    private val pending = ConcurrentHashMap<Int, Promise<JSONObject>>()
+    private val done = ConcurrentHashMap<Int, Promise<JSONObject>>()
     private val sinks = ConcurrentHashMap<Int, SinkEntry>()
     private val outgoing = ConcurrentHashMap<Int, CancelToken>()
 
@@ -136,7 +137,7 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
 
     fun request(req: JSONObject, id: Int? = null, timeoutSec: Long = 60, cancel: CancelToken? = null): JSONObject {
         val rid = id ?: newId()
-        val f = CompletableFuture<JSONObject>()
+        val f = Promise<JSONObject>()
         pending[rid] = f
         try {
             control().send(Rec.json(Rec.REQ, rid, req))
@@ -153,6 +154,12 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
 
     fun reply(id: Int, o: JSONObject) = control().send(Rec.json(Rec.RES, id, o))
     fun sendEvent(o: JSONObject) = control().send(Rec.json(Rec.EVT, 0, o))
+
+    /**
+     * An event that should arrive fast (screen input and screen acks): on Wi-Fi when it is up, otherwise Bluetooth.
+     * The other side accepts events on either link. It is still a control record, so it goes before data on that link.
+     */
+    fun sendFastEvent(o: JSONObject) = dataLink.send(Rec.json(Rec.EVT, 0, o))
     fun sendDone(id: Int, o: JSONObject) = control().send(Rec.json(Rec.DONE, id, o))
 
     fun cancel(id: Int) {
@@ -171,7 +178,7 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     fun forgetCancel(id: Int) { cancelHandlers.remove(id) }
     fun touchData() { lastDataActivity = System.currentTimeMillis() }
 
-    fun expectDone(id: Int): CompletableFuture<JSONObject> = CompletableFuture<JSONObject>().also { done[id] = it }
+    fun expectDone(id: Int): Promise<JSONObject> = Promise<JSONObject>().also { done[id] = it }
 
     fun forgetDone(id: Int) { done.remove(id) }
 
@@ -260,6 +267,20 @@ class Session(hr: HandshakeResult, val peerAddress: String, val initiator: Boole
     companion object {
         private val workers = Executors.newCachedThreadPool { r -> Thread(r, "bridge-worker").apply { isDaemon = true } }
         private val timer = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "session-timer").apply { isDaemon = true } }
+
+        /**
+         * Both sides connected to each other at the same moment (two connections a few seconds apart, in opposite
+         * directions). Each side must keep the same one, or each closes the one the other kept: the one opened by the
+         * device with the lower fingerprint stays. The Windows side has exactly the same rule (Bridge.KeepOlder).
+         * An older connection is always replaced, since it may be one that died without anyone noticing yet.
+         */
+        fun keepOlder(olderInitiator: Boolean, olderAgeMs: Long, newInitiator: Boolean, myFp: String, peerFp: String): Boolean {
+            if (olderAgeMs > 10_000 || olderInitiator == newInitiator) return false
+            val olderOpener = if (olderInitiator) myFp else peerFp
+            val newOpener = if (newInitiator) myFp else peerFp
+            // Ordinal comparison, like string.CompareOrdinal on Windows.
+            return olderOpener < newOpener
+        }
 
         fun throwIfError(o: JSONObject) {
             val err = o.str("err") ?: return

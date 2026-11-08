@@ -58,6 +58,26 @@ public class DialogBase : Window
 }
 
 /// <summary>Asks for the other device's password (first connection).</summary>
+/// <summary>"Send to" with more than one device connected: which one gets the files.</summary>
+public sealed class ChooseDeviceWindow : DialogBase
+{
+    private readonly ListBox _list = new() { MinHeight = 80, Margin = new Thickness(0, 8, 0, 0) };
+    public Session? Chosen => (_list.SelectedItem as ListBoxItem)?.Tag as Session;
+
+    public ChooseDeviceWindow(IEnumerable<Session> sessions, int files) : base("שליחה בגשר בלוטוס", "שלח")
+    {
+        Body.Children.Add(Text(files == 1 ? "לאיזה מכשיר לשלוח את הקובץ?" : $"לאיזה מכשיר לשלוח את {files} הפריטים?", bold: true));
+        foreach (var s in sessions) _list.Items.Add(new ListBoxItem { Content = App.Core.DisplayName(s), Tag = s });
+        _list.SelectedIndex = 0;
+        _list.MouseDoubleClick += (_, _) => { if (Chosen != null) DialogResult = true; };
+        Body.Children.Add(_list);
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Topmost = true;
+    }
+
+    protected override void FocusFirst() => _list.Focus();
+}
+
 public sealed class PasswordWindow : DialogBase
 {
     private readonly PasswordBox _pw = new();
@@ -164,6 +184,7 @@ public sealed class SettingsWindow : DialogBase
     };
     private readonly CheckBox _clip = new() { Content = "לוח הדבקה משותף: טקסט שמעתיקים באחד המכשירים אפשר להדביק בשני", Margin = new Thickness(0, 6, 0, 0) };
     private readonly CheckBox _notif = new() { Content = "להציג ליד השעון התראות שמופיעות בטלפון", Margin = new Thickness(0, 6, 0, 0) };
+    private readonly CheckBox _sendTo = new() { Content = "בקליק ימני על קובץ: \"שלח אל ← גשר בלוטוס\" שולח אותו לטלפון", Margin = new Thickness(0, 6, 0, 0) };
     private readonly ListBox _trusted = new() { Height = 120, DisplayMemberPath = "Label" };
 
     private sealed record TrustedRow(string Fp, string Label);
@@ -216,6 +237,8 @@ public sealed class SettingsWindow : DialogBase
         Body.Children.Add(_clip);
         _notif.IsChecked = st.ShowPhoneNotifications;
         Body.Children.Add(_notif);
+        _sendTo.IsChecked = st.SendToMenu;
+        Body.Children.Add(_sendTo);
         Body.Children.Add(new TextBlock
         {
             Text = "מצב \"בלי להפריע\" (שלב 3): כדי שהטלפון יעבוד על מסך משלו, הוסף למחשב מסך וירטואלי " +
@@ -252,6 +275,12 @@ public sealed class SettingsWindow : DialogBase
     protected override bool Validate()
     {
         if (_name.Text.Trim().Length == 0) { ShowError("הזן שם למחשב"); return false; }
+        // A full path only: an empty or partial one would put received files somewhere unexpected (or nowhere).
+        var dir = _dir.Text.Trim();
+        bool dirOk;
+        try { dirOk = Path.IsPathFullyQualified(dir) && dir.IndexOfAny(Path.GetInvalidPathChars()) < 0; }
+        catch { dirOk = false; }
+        if (!dirOk) { ShowError("תיקיית הקבצים שמתקבלים צריכה להיות נתיב מלא, שמתחיל באות של כונן. אפשר לבחור אותה בכפתור \"בחר…\"."); return false; }
         var st = App.Core.Settings;
         st.DeviceName = _name.Text.Trim();
         st.DownloadDir = _dir.Text.Trim();
@@ -262,7 +291,10 @@ public sealed class SettingsWindow : DialogBase
         st.DirectMode = _direct.IsChecked == true ? "auto" : "off";
         st.ShareClipboard = _clip.IsChecked == true;
         st.ShowPhoneNotifications = _notif.IsChecked == true;
+        bool sendToChanged = st.SendToMenu != (_sendTo.IsChecked == true);
+        st.SendToMenu = _sendTo.IsChecked == true;
         st.Save();
+        if (sendToChanged) ShellSend.Sync(st.SendToMenu);
         if (!st.AllowControl) ScreenSource.StopAll();
         try { Startup.Enabled = _startup.IsChecked == true; }
         catch (Exception ex) { ShowError("לא הצלחתי לשנות את ההפעלה עם המחשב: " + Heb.Of(ex)); return false; }

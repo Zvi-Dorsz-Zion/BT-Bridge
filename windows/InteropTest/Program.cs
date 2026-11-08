@@ -18,6 +18,8 @@ if (mode == "icon")
 }
 if (mode == "apptest") return AppTests.RunWindow();
 if (mode == "classictest") return AppTests.RunClassic();
+if (mode == "rtltest") return AppTests.RunClassic(rtl: true);
+if (mode == "explorertest") return AppTests.RunExplorer(args[1]);
 if (mode == "browsertest") return await AppTests.RunBrowser(args.Length > 1 ? args[1] : "edge");
 if (mode == "search")
 {

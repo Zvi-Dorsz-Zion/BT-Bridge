@@ -114,18 +114,31 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
             {
                 var from = Str(req, "from");
                 var to = Str(req, "to");
-                if (Exists(to)) throw new RemoteException("exists", "כבר קיים: " + to);
-                if (Directory.Exists(from)) Directory.Move(from, to);
+                // Only capital/small letters change (a.txt → A.txt): Windows sees the same name, so "exists" is wrong.
+                bool caseOnly = from != to && string.Equals(from, to, StringComparison.OrdinalIgnoreCase);
+                if (!caseOnly && Exists(to)) throw new RemoteException("exists", "כבר קיים: " + to);
+                if (Directory.Exists(from))
+                {
+                    if (caseOnly)
+                    {
+                        var tmp = from.TrimEnd('\\') + ".btrename";
+                        Directory.Move(from, tmp);
+                        Directory.Move(tmp, to);
+                    }
+                    else Directory.Move(from, to);
+                }
                 else File.Move(from, to);
                 return Ok();
             }
             case "delete":
             {
                 var paths = req["paths"]!.AsArray().Select(n => n!.GetValue<string>()).Where(Exists).ToList();
+                // USB sticks and network drives have no recycle bin: there Windows deletes for good.
+                bool recycled = paths.All(HasRecycleBin);
                 if (paths.Count > 0) Recycle(paths);
                 var left = paths.Where(Exists).ToList();
                 if (left.Count > 0) throw new RemoteException("io", "לא נמחק: " + string.Join(", ", left.Select(Path.GetFileName)));
-                return new JsonObject { ["ok"] = true, ["recycled"] = true };
+                return new JsonObject { ["ok"] = true, ["recycled"] = recycled };
             }
             case "read":
                 return await ReadAsync(s, id, req);
@@ -139,6 +152,34 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
     }
 
     private static JsonObject Ok() => new() { ["ok"] = true };
+
+    private static bool HasRecycleBin(string path)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            return !string.IsNullOrEmpty(root) && !root.StartsWith(@"\\") && new DriveInfo(root).DriveType == DriveType.Fixed;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Partial uploads being written now, so a resumed upload can take its file from the attempt that was cut off.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileSink> OpenParts =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Opens the partial file of an upload. When an attempt that was cut off still holds it (this side notices a dead
+    /// Wi-Fi link later than the other side), that attempt is ended first and the file is tried again for a few seconds.
+    /// </summary>
+    private static FileStream OpenPart(string part, bool resume)
+    {
+        if (OpenParts.TryRemove(part, out var old)) old.OnFail("הועבר להמשך בחיבור חדש");
+        for (int i = 0; ; i++)
+        {
+            try { return new FileStream(part, resume ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20); }
+            catch (IOException) when (i < 30 && File.Exists(part)) { Thread.Sleep(100); }
+        }
+    }
 
     private static string Str(JsonObject o, string key) =>
         o[key]?.GetValue<string>() ?? throw new RemoteException("bad", "חסר שדה: " + key);
@@ -327,13 +368,34 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
         // Resume (PROTOCOL.md section 4): the target name is chosen the same way again, so an interrupted
         // upload finds its own partial file and only the rest is sent.
         long have = 0;
-        bool resume = req["resume"]?.GetValue<bool>() == true && File.Exists(part);
-        var fs = new FileStream(part, resume ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
-        if (resume) have = fs.Length;
         var mtime = req["mtime"]?.GetValue<long>() ?? 0;
-        s.ExpectStream(id, new FileSink(fs, null,
+        // Which file the partial one came from (size and date), next to it: a partial file of a different file
+        // with the same name is started over instead of being continued with the wrong contents.
+        var info = part + ".info";
+        var source = $"{req["size"]?.GetValue<long>() ?? -1}|{mtime}";
+        bool resume = req["resume"]?.GetValue<bool>() == true && File.Exists(part);
+        if (resume && File.Exists(info))
+        {
+            try { resume = File.ReadAllText(info) == source; } catch { resume = false; }
+        }
+        var fs = OpenPart(part, resume);
+        if (resume) have = fs.Length;
+        else
+        {
+            try
+            {
+                TryDelete(info); // a hidden file can't be written over
+                File.WriteAllText(info, source);
+                File.SetAttributes(info, FileAttributes.Hidden);
+            }
+            catch (Exception ex) { Log.Write("part info: " + ex.Message); }
+        }
+        FileSink sink = null!;
+        sink = new FileSink(fs, null,
             _ =>
             {
+                OpenParts.TryRemove(new KeyValuePair<string, FileSink>(part, sink));
+                TryDelete(info);
                 try
                 {
                     File.Move(part, path, overwrite);
@@ -349,9 +411,12 @@ public sealed class FileService(Func<string> deviceName, Func<string> inboxDir, 
             },
             why =>
             {
-                if (FileSink.IsCancel(why)) TryDelete(part);
+                OpenParts.TryRemove(new KeyValuePair<string, FileSink>(part, sink));
+                if (FileSink.IsCancel(why)) { TryDelete(part); TryDelete(info); }
                 try { s.SendDone(id, new JsonObject { ["err"] = "cancelled", ["msg"] = why }); } catch { }
-            }));
+            });
+        OpenParts[part] = sink;
+        s.ExpectStream(id, sink);
         return new JsonObject { ["ok"] = true, ["path"] = path, ["have"] = have };
     }
 

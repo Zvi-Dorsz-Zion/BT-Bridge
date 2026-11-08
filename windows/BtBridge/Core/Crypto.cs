@@ -143,7 +143,16 @@ public static class Rec
         return o;
     }
 
-    public static byte[] Json(byte type, uint id, JsonObject o) => Make(type, id, Crypto.Utf8(o.ToJsonString()));
+    // Hebrew as plain UTF-8 (2 bytes a letter) instead of \uXXXX (6): names, paths and notifications are a third the size,
+    // which matters over Bluetooth. Any JSON reader (org.json on Android too) reads both the same way.
+    private static readonly System.Text.Json.JsonSerializerOptions Plain = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        // Required: without it, writing a list of plain values throws.
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver(),
+    };
+
+    public static byte[] Json(byte type, uint id, JsonObject o) => Make(type, id, Crypto.Utf8(o.ToJsonString(Plain)));
 
     public static (byte Type, uint Id, ReadOnlyMemory<byte> Body) Parse(byte[] p)
     {

@@ -187,8 +187,9 @@ public sealed class Bridge : IRequestHandler
         {
             var name = client.RemoteMachineName;
             using var bc = new BluetoothClient();
-            var d = bc.PairedDevices.FirstOrDefault(x => x.DeviceName == name);
-            if (d != null) return KeyOf(d.DeviceAddress);
+            // By name only when exactly one paired device has it: two phones with the same name would be mixed up.
+            var same = bc.PairedDevices.Where(x => x.DeviceName == name).Take(2).ToList();
+            if (same.Count == 1) return KeyOf(same[0].DeviceAddress);
         }
         catch { }
         return "";
@@ -207,16 +208,23 @@ public sealed class Bridge : IRequestHandler
         return Task.Run(() =>
         {
             var c = new BluetoothClient();
+            // A device that accepts the connection but never answers would leave this "connecting" forever
+            // (and hold up the automatic reconnects): give up after a while, like incoming connections do.
+            bool done = false;
+            using var guard = new Timer(_ => { if (!Volatile.Read(ref done)) try { c.Close(); } catch { } },
+                null, interactive ? 300_000 : 60_000, Timeout.Infinite);
             try
             {
                 c.Connect(address, ServiceUuid);
                 var stream = c.GetStream();
                 var hr = Handshake.Client(stream, Me, Settings, addr,
                     interactive ? AskPassword ?? throw new InvalidOperationException("no password UI") : (_, _) => null);
+                Volatile.Write(ref done, true);
                 return AddSession(hr, addr, true, new Link(false, stream, c, hr.Codec));
             }
             catch
             {
+                Volatile.Write(ref done, true);
                 try { c.Close(); } catch { }
                 throw;
             }
@@ -277,8 +285,33 @@ public sealed class Bridge : IRequestHandler
         return AddSession(hr, addr, true, new Link(false, stream, owner, hr.Codec));
     }
 
+    /// <summary>
+    /// Both sides connected to each other at the same moment (two connections a few seconds apart, in opposite directions).
+    /// Each side must keep the same one, or each closes the one the other kept: the one opened by the device with the
+    /// lower fingerprint stays (the Android side has the same rule). An older connection is always replaced, since it
+    /// may be one that died without anyone noticing yet.
+    /// </summary>
+    internal static bool KeepOlder(bool olderInitiator, long olderAgeMs, bool newInitiator, string myFp, string peerFp)
+    {
+        if (olderAgeMs > 10_000 || olderInitiator == newInitiator) return false;
+        string olderOpener = olderInitiator ? myFp : peerFp;
+        string newOpener = newInitiator ? myFp : peerFp;
+        return string.CompareOrdinal(olderOpener, newOpener) < 0;
+    }
+
     private Session AddSession(HandshakeResult hr, string addr, bool initiator, Link link)
     {
+        lock (_sessions)
+        {
+            var twin = _sessions.FirstOrDefault(x => x.PeerFp == hr.PeerFp && !x.Closed
+                && KeepOlder(x.Initiator, Environment.TickCount64 - x.CreatedAt, initiator, Me.Fp, hr.PeerFp));
+            if (twin != null)
+            {
+                Log.Write($"session {hr.PeerName}: both sides connected at once, keeping the earlier connection");
+                try { link.Close("כפול"); } catch { }
+                return twin;
+            }
+        }
         var s = new Session(hr, addr, initiator, this);
         List<Session> older;
         lock (_sessions)
@@ -326,7 +359,8 @@ public sealed class Bridge : IRequestHandler
                 {
                     // A separate browser that only the other device sees (PROTOCOL.md section 7).
                     int vw = Math.Clamp(req["vw"]?.GetValue<int>() ?? 412, 320, 1600), vh = Math.Clamp(req["vh"]?.GetValue<int>() ?? 860, 400, 2400);
-                    var b = await RemoteBrowser.StartAsync(Settings.Browser, Settings.DownloadDir, Settings.BrowserHome, vw, vh);
+                    var b = await RemoteBrowser.StartAsync(Settings.Browser, Settings.DownloadDir, Settings.BrowserHome, vw, vh,
+                        touch: req["touch"]?.GetValue<bool>() == true);
                     src = new ScreenSource(s, id, b, b, Codec, req) { Program = "דפדפן נפרד", Owned = b };
                     b.PageChanged += (url, title) => src.Info(new JsonObject { ["url"] = url, ["title"] = title });
                     mode = "browser";
@@ -455,16 +489,24 @@ public sealed class WifiLinks(Bridge bridge)
 
     private void AnnounceAll()
     {
-        foreach (var s in bridge.Sessions)
-            if (!s.HasWifi) Announce(s);
+        try
+        {
+            foreach (var s in bridge.Sessions)
+                if (!s.HasWifi) Announce(s);
+        }
+        catch (Exception ex) { Log.Write("announce all: " + ex.Message); }
     }
 
     public void Announce(Session s)
     {
-        var ips = new JsonArray();
-        foreach (var ip in LocalIps()) ips.Add(ip);
-        try { s.SendEvent(new JsonObject { ["ev"] = "net", ["ips"] = ips, ["port"] = _port }); }
-        catch { }
+        // Runs on timer and network-change threads: an exception here (adapters change exactly then) would end the app.
+        try
+        {
+            var ips = new JsonArray();
+            foreach (var ip in LocalIps()) ips.Add(ip);
+            s.SendEvent(new JsonObject { ["ev"] = "net", ["ips"] = ips, ["port"] = _port });
+        }
+        catch (Exception ex) { Log.Write("announce: " + ex.Message); }
     }
 
     /// <summary>After joining a new network: announce our address and try the other side's right away.</summary>

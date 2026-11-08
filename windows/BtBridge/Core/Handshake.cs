@@ -45,7 +45,9 @@ public static class Handshake
     public const int Version = 2;
 
     /// <summary>Optional features this side understands (PROTOCOL.md section 2, "caps").</summary>
-    public static readonly string[] Caps = { "clip", "notif", "resume", "ring", "battery", "update", "log", "search", "window", "browser" };
+    public static readonly string[] Caps = { "clip", "notif", "resume", "ring", "battery", "update", "log", "search", "window", "browser",
+        // 0.5: the separate browser takes touches (a finger drag scrolls), and a double tap arrives as one double click.
+        "touch", "dbl" };
 
     /// <summary>PBKDF2 rounds a peer may ask for: fewer would make a captured proof easy to crack, more would freeze us.</summary>
     public const int MinIter = 10_000, MaxIter = 5_000_000;

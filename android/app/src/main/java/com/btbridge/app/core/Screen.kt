@@ -269,8 +269,17 @@ class ScreenClient(private val s: Session) : StreamSink {
     @Volatile var mode = ""
         private set
 
+    /**
+     * Off (the default): each frame is acknowledged as soon as [onFrame] returned. On: the viewer calls [ack] itself once
+     * the frame is really on screen, so frames can't pile up while drawing lags behind (PROTOCOL.md section 7, flow control).
+     */
+    @Volatile var manualAck = false
+    /** [close] was called; an [open] still waiting for its answer cancels the stream as soon as it opens. */
+    @Volatile private var closed = false
+
     /** Blocking. [extra] adds fields: "window" (one program) or "browser" (PROTOCOL.md section 7). */
     fun open(monitor: Int, profile: String, restoreCursor: Boolean, extra: (JSONObject.() -> Unit)? = null) {
+        if (closed) throw java.util.concurrent.CancellationException("בוטל")
         id = s.newId()
         s.expectStream(id, this, sticky = false)
         clients[key(s, id)] = this
@@ -283,6 +292,8 @@ class ScreenClient(private val s: Session) : StreamSink {
             mode = res.str("mode") ?: "screen"
             val arr = res.optJSONArray("monitors") ?: JSONArray()
             monitors = (0 until arr.length()).map { arr.getJSONObject(it) }
+            // The viewer left while the other side was still opening: it started streaming after our cancel went out.
+            if (closed) close()
         } catch (e: Exception) {
             s.forgetStream(id)
             clients.remove(key(s, id))
@@ -311,15 +322,21 @@ class ScreenClient(private val s: Session) : StreamSink {
         runCatching { s.sendEvent(o) }
     }
 
-    /** Sends an input event; x/y are in frame pixels. */
+    /** Sends an input event; x/y are in frame pixels. Goes on Wi-Fi when it is up, so taps don't wait for Bluetooth. */
     fun input(type: String, x: Double = 0.0, y: Double = 0.0, extra: (JSONObject.() -> Unit)? = null) {
         val o = JSONObject().put("ev", "input").put("id", id).put("t", type).put("x", x).put("y", y)
             .put("fw", frameW).put("fh", frameH)
         extra?.invoke(o)
-        runCatching { s.sendEvent(o) }
+        runCatching { s.sendFastEvent(o) }
+    }
+
+    /** "Frame [seq] was drawn" (PROTOCOL.md section 7). Called by itself unless [manualAck] is on. */
+    fun ack(seq: Long) {
+        runCatching { s.sendFastEvent(JSONObject().put("ev", "screen-ack").put("id", id).put("seq", seq)) }
     }
 
     fun close() {
+        closed = true
         clients.remove(key(s, id))
         s.cancel(id)
     }
@@ -335,8 +352,11 @@ class ScreenClient(private val s: Session) : StreamSink {
         val f = ScreenProto.parse(this.buf.toByteArray())
         frameW = f.w
         frameH = f.h
-        try { onFrame?.invoke(f.seq, f.w, f.h, f.tiles) } catch (e: Exception) { Log.w("frame: ${e.message}") }
-        runCatching { s.sendEvent(JSONObject().put("ev", "screen-ack").put("id", id).put("seq", f.seq)) }
+        val cb = onFrame
+        var handed = false
+        try { if (cb != null) { cb(f.seq, f.w, f.h, f.tiles); handed = true } } catch (e: Exception) { Log.w("frame: ${e.message}") }
+        // With manual acks the viewer acks after drawing; a frame it never got is acked here, so the stream doesn't stall.
+        if (!manualAck || !handed) ack(f.seq)
     }
 
     override fun onEnd(end: JSONObject) { onClosed?.invoke("השיתוף הסתיים") }

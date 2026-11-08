@@ -20,9 +20,11 @@ public partial class App : Application
     {
         base.OnStartup(e);
         _mutex = new Mutex(true, InstanceName, out bool first);
+        var sendFiles = ShellSend.FilesIn(e.Args);
         if (!first)
         {
-            // Already running: ask the other instance to show its window.
+            // Already running: "Send to" hands it the files; otherwise ask it to show its window.
+            if (sendFiles is { Length: > 0 } && ShellSend.TryHandOver(sendFiles)) { Shutdown(); return; }
             try { EventWaitHandle.OpenExisting(InstanceName + "-show").Set(); } catch { }
             Shutdown();
             return;
@@ -78,9 +80,20 @@ public partial class App : Application
         // A click on a phone notification opens the list, to answer or open it; any other message opens the main window.
         _tray.BalloonTipClicked += (_, _) => { if (_noteBalloon) ShowNotes(); else ShowMain(); };
 
+        // "Send to → גשר בלוטוס" from File Explorer.
+        ShellSend.Sync(Core.Settings.SendToMenu);
+        ShellSend.Listen(files => Dispatcher.BeginInvoke(() => SendFromShell(files)));
+
         // Started with Windows: stay next to the clock.
         if (e.Args.Contains("--tray")) _main = new MainWindow();
+        else if (sendFiles is { Length: > 0 }) { _main = new MainWindow(); SendFromShell(sendFiles); }
         else ShowMain();
+    }
+
+    private void SendFromShell(string[] files)
+    {
+        _main ??= new MainWindow();
+        _ = _main.SendFromShell(files);
     }
 
     private bool _noteBalloon;
@@ -121,6 +134,9 @@ public partial class App : Application
         if (_tray != null) _tray.Visible = false;
         _tray?.Dispose();
         foreach (var s in Core.Sessions) s.Close();
+        // The separate browser writes its logins as it closes: give it the time before this program ends.
+        _main?.Hide();
+        RemoteBrowser.WaitClosed(TimeSpan.FromSeconds(12));
         Shutdown();
     }
 }

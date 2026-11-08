@@ -20,7 +20,6 @@ import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPublicKeySpec
 import java.text.Normalizer
-import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
@@ -130,8 +129,8 @@ object Crypto {
         Signature.getInstance("SHA256withECDSA").run { initVerify(fromPublic(pub)); update(data); verify(sig) }
     } catch (e: Exception) { false }
 
-    fun b64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
-    fun unb64(s: String): ByteArray = Base64.getDecoder().decode(s)
+    fun b64(b: ByteArray): String = B64.encode(b)
+    fun unb64(s: String): ByteArray = B64.decode(s)
 }
 
 open class ProtocolException(message: String) : IOException(message)

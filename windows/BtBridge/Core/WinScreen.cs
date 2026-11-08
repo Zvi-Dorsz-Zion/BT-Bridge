@@ -7,11 +7,23 @@ using Forms = System.Windows.Forms;
 namespace BtBridge.Core;
 
 /// <summary>Screen capture with GDI (StretchBlt straight into a scaled 32-bit DIB, cursor drawn in).</summary>
-public sealed class GdiGrabber : IScreenGrabber
+public sealed class GdiGrabber : IScreenGrabber, IDisposable
 {
     private readonly object _gate = new();
     private IntPtr _memDc, _dib, _bits;
     private int _dw, _dh;
+
+    /// <summary>Frees the scaled picture (several MB) and its drawing surface; a later Grab makes new ones.</summary>
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_dib != IntPtr.Zero) DeleteObject(_dib);
+            if (_memDc != IntPtr.Zero) DeleteDC(_memDc);
+            _dib = _memDc = _bits = IntPtr.Zero;
+            _dw = _dh = 0;
+        }
+    }
 
     public IReadOnlyList<MonitorInfo> Monitors()
     {
@@ -117,6 +129,7 @@ public sealed class GdiGrabber : IScreenGrabber
     [DllImport("gdi32.dll")] private static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bi, uint usage, out IntPtr bits, IntPtr section, uint offset);
     [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] private static extern int SetStretchBltMode(IntPtr dc, int mode);
     [DllImport("gdi32.dll")] private static extern bool SetBrushOrgEx(IntPtr dc, int x, int y, IntPtr old);
     [DllImport("gdi32.dll")] private static extern bool StretchBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, int rop);
@@ -193,6 +206,9 @@ public sealed class WinInput : IInputSink
                 if (restoreCursor) GetCursorPos(out _saved);
                 Move(x, y);
                 int n = Math.Clamp(ev["n"]?.GetValue<int>() ?? 1, 1, 3);
+                // "after" (PROTOCOL.md section 7): the first click of this double click was already sent by itself,
+                // so one more click at the same point makes Windows see a double click.
+                if (ev["after"]?.GetValue<bool>() == true) n = 1;
                 for (int i = 0; i < n; i++)
                 {
                     Mouse(Button(b, down: true));

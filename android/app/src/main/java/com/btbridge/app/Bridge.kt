@@ -41,6 +41,8 @@ import com.btbridge.app.core.Transfer
 import com.btbridge.app.core.WifiLinks
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
+import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.io.File
 import java.net.Inet4Address
@@ -50,12 +52,12 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.CancellationException
-import java.util.concurrent.CompletableFuture
+import com.btbridge.app.core.Promise
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-class PasswordRequest(val peerName: String, val wrongBefore: Boolean, val answer: CompletableFuture<PasswordAnswer?>)
+class PasswordRequest(val peerName: String, val wrongBefore: Boolean, val answer: Promise<PasswordAnswer?>)
 
 /** The app's core on Android: Bluetooth listener, outgoing connections, sessions, transfers. */
 class Bridge(private val ctx: Context) : RequestHandler {
@@ -108,16 +110,30 @@ class Bridge(private val ctx: Context) : RequestHandler {
         Thread(::listenLoop, "bt-listen").apply { isDaemon = true }.start()
         val timer = Executors.newSingleThreadScheduledExecutor()
         timer.scheduleAtFixedRate({
-            val active = transfers.value.filter { it.active }
-            if (active.isNotEmpty()) {
-                active.forEach { it.tick() }
-                tick.value++
+            // One exception must not stop the progress updates for good (a scheduled task that throws never runs again).
+            runCatching {
+                val active = transfers.value.filter { it.active }
+                if (active.isNotEmpty()) {
+                    active.forEach { it.tick() }
+                    tick.value++
+                }
             }
         }, 300, 300, TimeUnit.MILLISECONDS)
         timer.scheduleAtFixedRate({ runCatching { closeIdleHotspot() } }, 15, 15, TimeUnit.SECONDS)
         timer.scheduleAtFixedRate({ runCatching { cleanViewFiles() } }, 10, 15 * 60, TimeUnit.SECONDS)
         timer.scheduleAtFixedRate({ runCatching { holdWifiWhileBusy() } }, 2, 2, TimeUnit.SECONDS)
+        timer.scheduleAtFixedRate({ runCatching { cleanShareCopies() } }, 20, 6 * 3600, TimeUnit.SECONDS)
         watchBattery()
+    }
+
+    /** Copies of files shared from the gallery ("שלח למחשב"), each in its own folder; deleted after sending. */
+    fun newShareDir(): File = File(File(ctx.cacheDir, "שיתוף"), "${System.currentTimeMillis()}-${shareSeq.incrementAndGet()}").apply { mkdirs() }
+    private val shareSeq = java.util.concurrent.atomic.AtomicInteger()
+
+    /** Copies left over (a transfer that never finished, the app closed in the middle) are removed after a day. */
+    private fun cleanShareCopies() {
+        val before = System.currentTimeMillis() - 24 * 3_600_000L
+        File(ctx.cacheDir, "שיתוף").listFiles()?.forEach { d -> if (d.lastModified() < before) d.deleteRecursively() }
     }
 
     /** Deletes files that were opened only for viewing, after the time chosen in the settings. */
@@ -144,7 +160,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
         if (s.hasWifi) return
         wifi.refresh(s)
         repeat(12) { if (!s.hasWifi && !s.closed) Thread.sleep(250) }
-        if (s.hasWifi || store.directMode == "off" || s.peerOs != "windows") return
+        if (s.hasWifi || store.directMode == "off" || s.peerOs != "windows" || !DirectHotspot.supported) return
         try {
             openDirect(s)
             repeat(50) { if (!s.hasWifi && !s.closed) Thread.sleep(500) }
@@ -182,7 +198,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
     @Suppress("DEPRECATION")
     private fun holdWifiWhileBusy() {
         val busy = sessions.value.any { it.hasWifi && it.hasActiveStreams } || transfers.value.any { it.active }
-        val lock = wifiLock ?: ctx.applicationContext.getSystemService(WifiManager::class.java)
+        val lock = wifiLock ?: ctx.applicationContext.service<WifiManager>()
             ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "btbridge")?.apply { setReferenceCounted(false) }
             ?.also { wifiLock = it } ?: return
         if (busy && !lock.isHeld) lock.acquire() else if (!busy && lock.isHeld) lock.release()
@@ -197,8 +213,9 @@ class Bridge(private val ctx: Context) : RequestHandler {
             status = if (update) "עדכון לגשר בלוטוס מ-${displayName(s)}. הקש \"פתח\" כדי להתקין." else "התקבל מ-${displayName(s)}"
             resultPath = f.path
             active = false
+            succeeded = true
         }
-        transfers.value = listOf(t) + transfers.value
+        transfers.update { listOf(t) + it }
         received.tryEmit(Received(f, displayName(s), update))
     }
 
@@ -229,7 +246,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
         lastClip = text
         main.post {
             runCatching {
-                ctx.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("גשר בלוטוס", text))
+                ctx.service<ClipboardManager>()?.setPrimaryClip(ClipData.newPlainText("גשר בלוטוס", text))
             }.onFailure { Log.w("clipboard: ${it.message}") }
         }
     }
@@ -274,23 +291,33 @@ class Bridge(private val ctx: Context) : RequestHandler {
         val mp = Projection.obtain(ctx) ?: throw RemoteException("denied", "שיתוף המסך לא אושר בטלפון")
         val grab = ProjectionGrabber(ctx, mp)
         val src = ScreenSource(s, id, grab, AccessibilityInput, AndroidTileCodec, req)
+        // The user stopped the sharing from the system: end the stream (the computer sees it ended) instead of a frozen picture.
+        val stopped = object : android.media.projection.MediaProjection.Callback() {
+            override fun onStop() { src.stop() }
+        }
+        runCatching { mp.registerCallback(stopped, main) }
         ScreenSource.listeners += object : (ScreenSource, Boolean) -> Unit {
             override fun invoke(x: ScreenSource, on: Boolean) {
-                if (x === src && !on) { grab.release(); ScreenSource.listeners.remove(this) }
+                if (x === src && !on) {
+                    grab.release()
+                    runCatching { mp.unregisterCallback(stopped) }
+                    if (Projection.perShare) Projection.release(mp)
+                    ScreenSource.listeners.remove(this)
+                }
             }
         }
         s.reply(id, JSONObject().put("ok", true).put("kind", "android").put("monitors", org.json.JSONArray())
-            .put("input", BridgeAccessibility.instance != null))
+            .put("input", BridgeAccessibility.instance != null && BridgeAccessibility.gesturesSupported))
         src.start()
         notices.tryEmit("${displayName(s)} צופה במסך הטלפון")
         return null
     }
 
-    fun adapter(): BluetoothAdapter? = ctx.getSystemService(BluetoothManager::class.java)?.adapter
+    fun adapter(): BluetoothAdapter? = ctx.service<BluetoothManager>()?.adapter
 
     fun hasBtPermission(): Boolean =
         Build.VERSION.SDK_INT < 31 ||
-            ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
 
     // ------------------------------------------------------------------ incoming
 
@@ -366,16 +393,28 @@ class Bridge(private val ctx: Context) : RequestHandler {
     }
 
     private fun askPassword(peerName: String, wrong: Boolean): PasswordAnswer? {
-        val f = CompletableFuture<PasswordAnswer?>()
+        val f = Promise<PasswordAnswer?>()
         passwordRequest.value = PasswordRequest(peerName, wrong, f)
         return try { f.get(3, TimeUnit.MINUTES) } catch (e: Exception) { null } finally { passwordRequest.value = null }
     }
 
     private fun addSession(hr: HandshakeResult, addr: String, initiator: Boolean, link: Link): Session {
         val s = Session(hr, addr, initiator, this)
-        val older = list.filter { it.peerFp == hr.peerFp }
-        list.removeAll(older.toSet())
-        list.add(s)
+        val older = synchronized(list) {
+            // Both sides connected at the same moment: keep the same connection the other side keeps (Session.keepOlder).
+            val now = System.nanoTime() / 1_000_000
+            val twin = list.firstOrNull { it.peerFp == hr.peerFp && !it.closed &&
+                Session.keepOlder(it.initiator, now - it.createdAt, initiator, me.fp, hr.peerFp) }
+            if (twin != null) {
+                Log.w("session ${hr.peerName}: both sides connected at once, keeping the earlier connection")
+                runCatching { link.close("כפול") }
+                return twin
+            }
+            list.filter { it.peerFp == hr.peerFp }.also { o ->
+                list.removeAll(o.toSet())
+                list.add(s)
+            }
+        }
         older.forEach { it.close() }
         s.onClosed = { list.remove(it); publish() }
         s.onChanged = { publish() }
@@ -442,7 +481,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
      */
     fun queue(t: Transfer, after: ((Boolean) -> Unit)? = null) {
         if (after != null) t.after = after
-        if (transfers.value.none { it === t }) transfers.value = listOf(t) + transfers.value
+        transfers.update { l -> if (l.none { it === t }) listOf(t) + l else l }
         transferExec.execute { runTransfer(t) }
     }
 
@@ -460,6 +499,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
                 try {
                     t.work!!(s, t)
                     t.status = "הושלם ✓"
+                    t.succeeded = true
                     ok = true
                 } catch (e: Exception) {
                     val why = com.btbridge.app.core.Heb.of(e)
@@ -501,7 +541,29 @@ class Bridge(private val ctx: Context) : RequestHandler {
         transfers.value.filter { it.interrupted && !it.active && it.peerFp == fp }.reversed().forEach { resume(it) }
     }
 
-    fun clearFinished() { transfers.value = transfers.value.filter { it.active || it.interrupted } }
+    fun clearFinished() { transfers.update { l -> l.filter { it.active || it.interrupted } } }
+
+    /**
+     * Files that arrived here and were later deleted leave the list by themselves. Only finished, successful
+     * downloads and received files; uploads and active, interrupted or failed transfers always stay.
+     */
+    fun dropGoneDownloads() {
+        fun gone(t: Transfer) = t.succeeded && !t.upload && !t.active && !t.interrupted &&
+            t.resultPath?.let { !File(it).exists() } == true
+        if (transfers.value.none(::gone)) return
+        transfers.update { l -> l.filterNot(::gone) }
+    }
+
+    /**
+     * "Remove device": closes its connection, forgets the trust, and deletes its nickname, saved places and sort choices.
+     * [key] is its Bluetooth address key; [fp] is empty for a paired device that never connected.
+     */
+    fun removeDevice(fp: String, key: String) {
+        for (s in sessions.value) if ((fp.isNotEmpty() && s.peerFp == fp) || (key.isNotEmpty() && s.peerAddress == key)) s.close()
+        if (fp.isNotEmpty()) store.forget(fp)
+        store.removeDeviceData(fp, key)
+        Log.w("device removed: ${fp.ifEmpty { key }}")
+    }
 
     fun runInBackground(f: () -> Unit) = bg.execute(f)
 
@@ -519,7 +581,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
             val d = File(ext, rel)
             if (d.isDirectory) out += Root(name, d)
         }
-        val sm = ctx.getSystemService(StorageManager::class.java)
+        val sm = ctx.service<StorageManager>()
         var primaryAdded = false
         if (Build.VERSION.SDK_INT >= 30 && sm != null) {
             for (v in sm.storageVolumes) {
@@ -549,7 +611,7 @@ class Bridge(private val ctx: Context) : RequestHandler {
     /** Opens a TCP socket on the network that actually contains [ip] (Wi-Fi without internet is not the default). */
     private fun connectTcp(ip: String, port: Int, timeoutMs: Int): Socket {
         val target = InetAddress.getByName(ip)
-        val cm = ctx.getSystemService(ConnectivityManager::class.java)
+        val cm = ctx.service<ConnectivityManager>()
         @Suppress("DEPRECATION")
         val net = cm?.allNetworks?.firstOrNull { n ->
             cm.getLinkProperties(n)?.linkAddresses?.any { la -> samePrefix(la.address, target, la.prefixLength) } == true

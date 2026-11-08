@@ -29,7 +29,7 @@ public partial class PhoneScreenWindow : Window
         InitializeComponent();
         Icon = AppIcon.Window();
         _s = s;
-        _sc = new ScreenClient(s);
+        _sc = new ScreenClient(s) { AckAfterDraw = true };
         Title = "מסך הטלפון · " + name;
         WaitText.Text = "מבקש מהטלפון לשתף את המסך…\nאם זו הפעם הראשונה מאז שהאפליקציה נפתחה, אשר בטלפון.";
         _sc.Frame += OnFrame;
@@ -58,7 +58,11 @@ public partial class PhoneScreenWindow : Window
         try
         {
             await App.Core.EnsureFastLinkAsync(_s);
+            // Closed while waiting: don't ask the phone to start sharing at all.
+            if (_closed) return;
             await _sc.OpenAsync(0, "auto", false);
+            // Closed while the phone was opening the stream: the first cancel may have come before the phone set it up.
+            if (_closed) { _sc.Close(); return; }
             WaitText.Text = "מתחבר למסך…";
             if (!_sc.InputAvailable)
                 MessageBox.Show(this, "אפשר לראות את מסך הטלפון, אבל לא ללחוץ עליו.\nכדי לשלוט, הפעל בטלפון: הגדרות ← נגישות ← גשר בלוטוס.",
@@ -77,7 +81,18 @@ public partial class PhoneScreenWindow : Window
     {
         var decoded = tiles.Select(t => (t, px: _codec.Decode(t.Jpeg, out var tw, out var th), tw, th)).ToList();
         _bytes += tiles.Sum(t => t.Jpeg.Length);
-        Dispatcher.Invoke(() =>
+        // Not Invoke: waiting for a busy window here would stop the whole link from reading (and drop it after 45 s).
+        // The phone is told the frame arrived only once it is drawn, so pictures don't pile up while the window is busy.
+        Dispatcher.BeginInvoke(() =>
+        {
+            try { Draw(w, h, decoded); }
+            finally { _sc.Ack(seq); }
+        });
+    }
+
+    private void Draw(int w, int h, List<(ScreenTile t, int[] px, int tw, int th)> decoded)
+    {
+        if (_closed) return;
         {
             if (_bmp == null || _bmp.PixelWidth != w || _bmp.PixelHeight != h)
             {
@@ -92,7 +107,7 @@ public partial class PhoneScreenWindow : Window
             }
             WaitText.Visibility = Visibility.Collapsed;
             _frames++;
-        });
+        }
     }
 
     // ---------------------------------------------------------------- input

@@ -34,7 +34,7 @@ import com.btbridge.app.core.TileCodec
 import com.btbridge.app.core.str
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.CompletableFuture
+import com.btbridge.app.core.Promise
 import java.util.concurrent.TimeUnit
 
 /**
@@ -44,19 +44,31 @@ import java.util.concurrent.TimeUnit
 object Projection {
     @Volatile var projection: MediaProjection? = null
         private set
-    @Volatile private var pending: CompletableFuture<Boolean>? = null
+    @Volatile private var pending: Promise<MediaProjection?>? = null
     private const val NOTIF_ID = 7
+    /** Two requests at once must not share (or overwrite) one approval dialog: the second waits for the first. */
+    private val obtainLock = Any()
+    /** Every projection that is still running (Android 14+ can have one per share), for [stop]. */
+    private val running = java.util.concurrent.CopyOnWriteArraySet<MediaProjection>()
+
+    /**
+     * Android 14+ lets one approval make only one capture, so every share asks again and stops its projection at the end.
+     * Up to Android 13 the approval is kept while the background service lives, as before.
+     */
+    val perShare: Boolean get() = Build.VERSION.SDK_INT >= 34
 
     /** Blocking (worker thread). Asks the user when there is no approval yet; null when not approved in time. */
-    fun obtain(ctx: Context): MediaProjection? {
-        projection?.let { return it }
-        val f = CompletableFuture<Boolean>()
+    fun obtain(ctx: Context): MediaProjection? = synchronized(obtainLock) { obtainNow(ctx) }
+
+    private fun obtainNow(ctx: Context): MediaProjection? {
+        if (!perShare) projection?.let { return it }
+        val f = Promise<MediaProjection?>()
         pending = f
         val open = Intent(ctx, ProjectionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         // From the background Android shows this as a notification; when the app is open it starts right away.
         runCatching { ctx.startActivity(open) }
-        val pi = PendingIntent.getActivity(ctx, 3, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val n = Notification.Builder(ctx, App.CHANNEL_EVENTS)
+        val pi = PendingIntent.getActivity(ctx, 3, open, PI_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = notificationBuilder(ctx, App.CHANNEL_EVENTS)
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setContentTitle("המחשב מבקש לראות את המסך")
             .setContentText("הקש כדי לאשר שיתוף מסך")
@@ -64,44 +76,55 @@ object Projection {
             .setFullScreenIntent(pi, true)
             .setAutoCancel(true)
             .build()
-        val nm = ctx.getSystemService(android.app.NotificationManager::class.java)
-        runCatching { nm.notify(NOTIF_ID, n) }
+        val nm = ctx.service<android.app.NotificationManager>()
+        runCatching { nm?.notify(NOTIF_ID, n) }
         return try {
-            if (f.get(90, TimeUnit.SECONDS)) projection else null
+            f.get(90, TimeUnit.SECONDS)
         } catch (e: Exception) {
             null
         } finally {
             pending = null
-            nm.cancel(NOTIF_ID)
+            runCatching { nm?.cancel(NOTIF_ID) }
         }
     }
 
     fun onResult(ctx: Context, code: Int, data: Intent?) {
         if (code != Activity.RESULT_OK || data == null) {
-            pending?.complete(false)
+            pending?.complete(null)
             return
         }
         try {
             // Android 10+ requires a running "media projection" foreground service before getMediaProjection.
             BridgeService.promoteForProjection(ctx)
-            val mp = ctx.getSystemService(MediaProjectionManager::class.java).getMediaProjection(code, data)
+            val mp = ctx.service<MediaProjectionManager>()?.getMediaProjection(code, data)
                 ?: error("המערכת לא אישרה את שיתוף המסך")
             mp.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
-                    projection = null
+                    if (projection === mp) projection = null
+                    running.remove(mp)
                     Log.w("projection stopped")
                 }
             }, Handler(ctx.mainLooper))
+            running.add(mp)
             projection = mp
-            pending?.complete(true)
+            pending?.complete(mp)
         } catch (e: Exception) {
             Log.w("projection: ${e.message}")
-            pending?.complete(false)
+            pending?.complete(null)
         }
     }
 
+    /** A share ended (Android 14+): its projection can't be used again, so it is stopped. */
+    fun release(mp: MediaProjection) {
+        running.remove(mp)
+        if (projection === mp) projection = null
+        runCatching { mp.stop() }
+    }
+
     fun stop() {
-        projection?.stop()
+        running.forEach { runCatching { it.stop() } }
+        running.clear()
+        projection?.let { runCatching { it.stop() } }
         projection = null
     }
 }
@@ -110,7 +133,14 @@ object Projection {
 class ProjectionActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val mpm = getSystemService(MediaProjectionManager::class.java)
+        // Recreated (the system dialog is already showing): don't ask a second time.
+        if (savedInstanceState != null) return
+        val mpm = service<MediaProjectionManager>()
+        if (mpm == null) {
+            Projection.onResult(applicationContext, RESULT_CANCELED, null)
+            finish()
+            return
+        }
         @Suppress("DEPRECATION")
         startActivityForResult(mpm.createScreenCaptureIntent(), 1)
     }
@@ -137,7 +167,7 @@ class ProjectionGrabber(private val ctx: Context, private val mp: MediaProjectio
     private fun metrics(): DisplayMetrics {
         val m = DisplayMetrics()
         @Suppress("DEPRECATION")
-        ctx.getSystemService(WindowManager::class.java).defaultDisplay.getRealMetrics(m)
+        ctx.service<WindowManager>()?.defaultDisplay?.getRealMetrics(m)
         return m
     }
 
@@ -220,6 +250,9 @@ class BridgeAccessibility : AccessibilityService() {
         @Volatile var instance: BridgeAccessibility? = null
             private set
 
+        /** Taps and swipes from the computer need Android 7.0 (typing works before it too). */
+        val gesturesSupported: Boolean get() = Build.VERSION.SDK_INT >= 24
+
         fun isEnabled(ctx: Context): Boolean {
             if (instance != null) return true
             val list = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
@@ -235,6 +268,8 @@ class BridgeAccessibility : AccessibilityService() {
     override fun onInterrupt() {}
 
     private fun stroke(path: Path, ms: Long) {
+        // Gestures from an accessibility service exist from Android 7.0.
+        if (Build.VERSION.SDK_INT < 24) return
         dispatchGesture(GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, ms.coerceIn(1, 10_000)))
             .build(), null, null)

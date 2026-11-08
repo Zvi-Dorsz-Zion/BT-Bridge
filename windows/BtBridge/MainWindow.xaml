@@ -66,6 +66,7 @@
                             <MenuItem x:Name="MenuDisconnect" Header="נתק" Click="Disconnect_Click" />
                             <MenuItem Header="שנה כינוי…" Click="Rename_Device_Click" />
                             <MenuItem x:Name="MenuForget" Header="שכח מכשיר (בפעם הבאה תידרש סיסמה)" Click="Forget_Click" />
+                            <MenuItem x:Name="MenuRemove" Header="הסר מכשיר מהרשימה…" Click="RemoveDevice_Click" />
                             <Separator />
                             <MenuItem x:Name="MenuLog" Header="הצג את היומן של המכשיר (לבירור תקלות)" Click="DeviceLog_Click" />
                         </ContextMenu>
@@ -124,6 +125,9 @@
             </DockPanel>
             <DockPanel DockPanel.Dock="Top" Margin="4,0,4,4">
                 <TextBlock x:Name="SelectionText" DockPanel.Dock="Left" FontSize="12" Foreground="{StaticResource Accent}" />
+                <CheckBox x:Name="FoldersFirstBox" DockPanel.Dock="Right" Content="תיקיות קודם" FontSize="12" Margin="8,0,0,0"
+                          Visibility="Collapsed" Checked="FoldersFirst_Changed" Unchecked="FoldersFirst_Changed"
+                          ToolTip="מסומן: התיקיות למעלה ואחריהן הקבצים. לא מסומן: הכול מעורב לפי המיון, כמו בסייר הקבצים. הבחירה נשמרת לכל תיקייה." />
                 <TextBlock x:Name="SortText" FontSize="12" Foreground="{StaticResource Muted}" TextTrimming="CharacterEllipsis"
                            ToolTip="לחיצה על כותרת עמודה משנה את המיון. הבחירה נשמרת לכל תיקייה." />
             </DockPanel>

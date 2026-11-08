@@ -80,13 +80,27 @@ public sealed class WindowGrabber(IntPtr hwnd) : IScreenGrabber
         Native.GetClientRect(Hwnd, out var r);
         var p = new Native.POINT { X = 0, Y = 0 };
         Native.ClientToScreen(Hwnd, ref p);
+        // A right-to-left window (File Explorer and others in Hebrew Windows) counts from its right edge:
+        // its point (0,0) is the top RIGHT corner, so the left edge is one width further left.
+        if (IsMirrored(Hwnd)) p.X -= r.Right;
         return new Native.RECT { Left = p.X, Top = p.Y, Right = p.X + r.Right, Bottom = p.Y + r.Bottom };
     }
 
+    /// <summary>A window laid out right to left (WS_EX_LAYOUTRTL): its picture from PrintWindow comes out mirrored.</summary>
+    public static bool IsMirrored(IntPtr h) => (Native.GetWindowLong(h, Native.GWL_EXSTYLE) & Native.WS_EX_LAYOUTRTL) != 0;
+
     public IReadOnlyList<MonitorInfo> Monitors()
     {
-        var c = Client();
-        return new[] { new MonitorInfo(0, Native.Title(Hwnd), c.Left, c.Top, Math.Max(2, c.Width), Math.Max(2, c.Height), true) };
+        // In real screen pixels from both corners: for a program that isn't DPI-aware (at 125%/150%) GetClientRect gives
+        // a smaller, "logical" size, and taps computed from it landed up and to the left. The picture itself (Grab) doesn't
+        // depend on this: it is drawn at the program's own size and scaled to the frame.
+        Native.GetClientRect(Hwnd, out var r);
+        var a = new Native.POINT { X = 0, Y = 0 };
+        var b = new Native.POINT { X = r.Right, Y = r.Bottom };
+        Native.ClientToScreen(Hwnd, ref a);
+        Native.ClientToScreen(Hwnd, ref b);
+        int left = Math.Min(a.X, b.X), top = Math.Min(a.Y, b.Y);
+        return new[] { new MonitorInfo(0, Native.Title(Hwnd), left, top, Math.Max(2, Math.Abs(b.X - a.X)), Math.Max(2, Math.Abs(b.Y - a.Y)), true) };
     }
 
     public int[]? Grab(int monitor, int w, int h)
@@ -132,7 +146,30 @@ public sealed class WindowGrabber(IntPtr hwnd) : IScreenGrabber
             try { Native.PrintWindow(h, dc, (clientOnly ? Native.PW_CLIENTONLY : 0) | Native.PW_RENDERFULLCONTENT); }
             finally { bg.ReleaseHdc(dc); }
         }
+        // Right-to-left windows come out mirrored (the text read backwards): turn the picture back.
+        if (WindowGrabber.IsMirrored(h)) bmp.RotateFlip(System.Drawing.RotateFlipType.RotateNoneFlipX);
         g.DrawImageUnscaled(bmp, r.Left - origin.Left, r.Top - origin.Top);
+    }
+
+    private static readonly HashSet<string> ShellWindows = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "ApplicationFrameWindow",
+    };
+
+    /// <summary>
+    /// A window of the same program that belongs to this one (its menu, dialog, pop-up). File Explorer's process also owns
+    /// the desktop, the taskbar and its other folder windows; another main window of any program is a window of its own
+    /// (it has its own line in the list of programs). Painting those over this window hid it (all black in File Explorer).
+    /// </summary>
+    private bool IsPartOfThisWindow(IntPtr h)
+    {
+        if (Native.IsCloaked(h) || ShellWindows.Contains(Native.ClassOf(h))) return false;
+        for (var o = Native.GetWindow(h, Native.GW_OWNER); o != IntPtr.Zero; o = Native.GetWindow(o, Native.GW_OWNER))
+            if (o == Hwnd) return true;
+        // Not owned by us: a separate main window when it has a title bar and is not a tool window.
+        int style = Native.GetWindowLong(h, Native.GWL_STYLE);
+        int ex = Native.GetWindowLong(h, Native.GWL_EXSTYLE);
+        return (style & Native.WS_CAPTION) != Native.WS_CAPTION || (ex & Native.WS_EX_TOOLWINDOW) != 0;
     }
 
     /// <summary>Visible windows of the same program that lie over this one (menus, dialogs, pop-ups), back to front.</summary>
@@ -142,9 +179,11 @@ public sealed class WindowGrabber(IntPtr hwnd) : IScreenGrabber
         var found = new List<IntPtr>();
         Native.EnumWindows((h, _) =>
         {
-            if (h == Hwnd || !Native.IsWindowVisible(h) || Native.IsIconic(h)) return true;
+            // From the top down: everything after this window is behind it (the desktop among them).
+            if (h == Hwnd) return false;
+            if (!Native.IsWindowVisible(h) || Native.IsIconic(h)) return true;
             Native.GetWindowThreadProcessId(h, out var p);
-            if (p != pid) return true;
+            if (p != pid || !IsPartOfThisWindow(h)) return true;
             Native.GetWindowRect(h, out var r);
             if (r.Right > area.Left && r.Left < area.Right && r.Bottom > area.Top && r.Top < area.Bottom) found.Add(h);
             return true;
@@ -204,6 +243,18 @@ public sealed class WindowInput(WindowGrabber win, Action<string>? modeChanged =
             {
                 int n = Math.Clamp(ev["n"]?.GetValue<int>() ?? 1, 1, 3);
                 if (b == 0 && n == 1 && TryUia(x, y)) { SetMode("uia"); return; }
+                // A double tap on a file or folder in a list (File Explorer): "open" it the accessible way.
+                if (b == 0 && n == 2 && TryUiaOpen(x, y)) { SetMode("uia"); return; }
+                bool after = ev["after"]?.GetValue<bool>() == true;
+                if (after && n == 2)
+                {
+                    // The first click was already sent by itself: only the second half of a double click.
+                    var target = ChildAt(x, y);
+                    PostMouse(x, y, b == 1 ? Native.WM_RBUTTONDBLCLK : Native.WM_LBUTTONDBLCLK, b == 1 ? Native.MK_RBUTTON : Native.MK_LBUTTON, target);
+                    PostMouse(x, y, b == 1 ? Native.WM_RBUTTONUP : Native.WM_LBUTTONUP, 0, target);
+                    SetMode("window");
+                    break;
+                }
                 PostClick(x, y, b, n);
                 SetMode("window");
                 break;
@@ -290,6 +341,24 @@ public sealed class WindowInput(WindowGrabber win, Action<string>? modeChanged =
                     if (ec.Current.ExpandCollapseState == ExpandCollapseState.Expanded) ec.Collapse(); else ec.Expand();
                     return true;
                 }
+            }
+            catch { return false; }
+        }
+        return false;
+    }
+
+    private bool TryUiaOpen(int x, int y)
+    {
+        var e = ElementAt(x, y);
+        for (int up = 0; e != null && up < 4; up++, e = TreeWalker.ControlViewWalker.GetParent(e))
+        {
+            try
+            {
+                var ct = e.Current.ControlType;
+                if (ct != ControlType.ListItem && ct != ControlType.DataItem && ct != ControlType.TreeItem) continue;
+                if (!e.TryGetCurrentPattern(InvokePattern.Pattern, out var ip)) return false;
+                ((InvokePattern)ip).Invoke();
+                return true;
             }
             catch { return false; }
         }
@@ -447,7 +516,16 @@ public sealed class WindowInput(WindowGrabber win, Action<string>? modeChanged =
 /// <summary>Windows functions for window capture and window messages.</summary>
 public static class Native
 {
-    public const int GW_OWNER = 4, GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, SW_SHOWNOACTIVATE = 4;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+    public static string ClassOf(IntPtr h)
+    {
+        var s = new System.Text.StringBuilder(128);
+        GetClassName(h, s, s.Capacity);
+        return s.ToString();
+    }
+
+    public const int GWL_STYLE = -16, WS_CAPTION = 0x00C00000;
+    public const int GW_OWNER = 4, GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, SW_SHOWNOACTIVATE = 4, WS_EX_LAYOUTRTL = 0x400000;
     public const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOACTIVATE = 0x10;
     public static readonly IntPtr HWND_BOTTOM = new(1);
     public const uint PW_CLIENTONLY = 1, PW_RENDERFULLCONTENT = 2;

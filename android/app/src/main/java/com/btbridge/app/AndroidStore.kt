@@ -31,15 +31,27 @@ class AndroidStore(val ctx: Context) : Store {
 
     fun setDeviceName(v: String) { prefs.edit().putString("name", v).apply(); version.value++ }
 
+    /**
+     * Access to all the phone's files: "all files access" on Android 11+, the storage permission on 6.0-10,
+     * and always before 6.0 (permissions are given at install there).
+     */
+    val allFiles: Boolean
+        get() = when {
+            Build.VERSION.SDK_INT >= 30 -> Environment.isExternalStorageManager()
+            Build.VERSION.SDK_INT >= 23 -> androidx.core.content.ContextCompat.checkSelfPermission(ctx,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            else -> true
+        }
+
     /** Download/גשר בלוטוס. Without "all files access" Android blocks it, so the app's own folder is used instead. */
     val downloadDir: File
-        get() = if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager())
+        get() = if (allFiles)
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "גשר בלוטוס")
         else File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "גשר בלוטוס")
 
     /** Where "download" saves, in words for the user. */
     val downloadLabel: String
-        get() = if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "הורדות ← גשר בלוטוס"
+        get() = if (allFiles) "הורדות ← גשר בלוטוס"
         else "התיקייה הפנימית של האפליקציה"
 
     /** Files opened only for viewing are deleted after this many hours. */
@@ -84,6 +96,40 @@ class AndroidStore(val ctx: Context) : Store {
 
     fun setSort(fp: String, path: String, by: String, desc: Boolean) {
         prefs.edit().putString("sort:$fp|$path", "$by|${if (desc) "desc" else "asc"}").apply()
+        version.value++
+    }
+
+    /** "Folders first" chosen for a folder of a device, or null for the usual choice ([FileOrder.defaultFoldersFirst]). */
+    fun foldersFirstFor(fp: String, path: String): Boolean? =
+        if (prefs.contains("sortff:$fp|$path")) prefs.getBoolean("sortff:$fp|$path", true) else null
+
+    fun setFoldersFirst(fp: String, path: String, on: Boolean) {
+        prefs.edit().putBoolean("sortff:$fp|$path", on).apply()
+        version.value++
+    }
+
+    /** "Mouse mode" on the computer screen: a one-finger drag moves the mouse instead of scrolling. */
+    var remoteMouseMode: Boolean
+        get() = prefs.getBoolean("remoteMouseMode", false)
+        set(v) { prefs.edit().putBoolean("remoteMouseMode", v).apply() }
+
+    /** Android 13+: the notifications permission was asked once on the home screen (the permissions page can ask again). */
+    var notificationsAsked: Boolean
+        get() = prefs.getBoolean("notificationsAsked", false)
+        set(v) { prefs.edit().putBoolean("notificationsAsked", v).apply() }
+
+    /**
+     * "Remove device": its nickname, saved places and sort choices. [fp] is its fingerprint (empty for a paired device
+     * that never connected), [key] its Bluetooth address key (nicknames of such devices are kept by address).
+     */
+    fun removeDeviceData(fp: String, key: String) {
+        val e = prefs.edit()
+        if (key.isNotEmpty()) e.remove("nick:$key")
+        if (fp.isNotEmpty()) {
+            e.remove("nick:$fp").remove("saved:$fp")
+            for (k in prefs.all.keys) if (k.startsWith("sort:$fp|") || k.startsWith("sortff:$fp|")) e.remove(k)
+        }
+        e.apply()
         version.value++
     }
 

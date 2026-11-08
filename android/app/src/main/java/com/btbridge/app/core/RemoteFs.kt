@@ -6,7 +6,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -38,10 +37,13 @@ class Transfer(val name: String, val upload: Boolean, val peerFp: String = "", v
 
     /** Runs once, when the transfer finally finished (true = succeeded). */
     @Volatile var after: ((Boolean) -> Unit)? = null
+    /** It finished successfully (set by whoever runs it). */
+    @Volatile var succeeded = false
 
     /** Ready for another try. */
     fun restart() {
         cancel = CancelToken()
+        succeeded = false
         interrupted = false
         active = true
         status = "ממתין"
@@ -141,7 +143,7 @@ object RemoteFs {
         t.attempts++
         t.setDone(offset)
         val out = FileOutputStream(part, offset > 0)
-        val end = CompletableFuture<Unit>()
+        val end = Promise<Unit>()
         val id = s.newId()
         s.expectStream(id, FileSink(out, t::add, { end.complete(Unit) }, { end.completeExceptionally(IOException(it)) }))
         t.cancel.onCancel { s.cancel(id) }

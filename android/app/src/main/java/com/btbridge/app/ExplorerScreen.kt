@@ -256,8 +256,9 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
     storeVersion.let { }
     val saved = b.store.savedFor(s.peerFp)
     val (sortBy, sortDesc) = b.store.sortFor(s.peerFp, path) ?: FileOrder.default(path)
+    val foldersFirst = b.store.foldersFirstFor(s.peerFp, path) ?: FileOrder.defaultFoldersFirst(path)
     // The virtual root keeps the other side's order (quick folders, then drives).
-    val folderItems = listing?.items.orEmpty().let { if (inFolder) FileOrder.sort(it, sortBy, sortDesc) else it }
+    val folderItems = listing?.items.orEmpty().let { if (inFolder) FileOrder.sort(it, sortBy, sortDesc, foldersFirst) else it }
     // Rows on screen, each with "is it a saved place": search results, or the folder.
     // The list of places starts with the saved places on this device.
     val rows: List<Pair<RemoteItem, Boolean>> = results?.items?.map { it to false }
@@ -408,6 +409,13 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
                             onClick = { sortMenu = false; b.store.setSort(s.peerFp, path, by, desc) },
                         )
                     }
+                    HorizontalDivider()
+                    // Folders first, or folders and files mixed by the same order; kept per folder like the sort.
+                    DropdownMenuItem(
+                        text = { Text("תיקיות קודם") },
+                        leadingIcon = { Checkbox(foldersFirst, null) },
+                        onClick = { sortMenu = false; b.store.setFoldersFirst(s.peerFp, path, !foldersFirst) },
+                    )
                 }
             }
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -498,7 +506,7 @@ fun ExplorerScreen(s: Session, onBack: () -> Unit, onTransfers: () -> Unit, onRe
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("למחוק $n פריטים?") },
-            text = { Text(if (s.peerOs == "windows") "הם יעברו לסל המיחזור במחשב." else "המחיקה היא לצמיתות.") },
+            text = { Text(if (s.peerOs == "windows") "הם יעברו לסל המיחזור במחשב (בכונן נייד או בכונן רשת אין סל מיחזור, ושם המחיקה לצמיתות)." else "המחיקה היא לצמיתות.") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDelete = false

@@ -26,6 +26,8 @@ public sealed class Session
     public string PeerFp { get; }
     public string PeerAddress { get; }
     public bool Initiator { get; }
+    /// <summary>When the connection was made (Environment.TickCount64).</summary>
+    public long CreatedAt { get; } = Environment.TickCount64;
     public byte[] LinkKey { get; }
     public bool Closed { get; private set; }
     /// <summary>The other side's program version ("0.3.0").</summary>

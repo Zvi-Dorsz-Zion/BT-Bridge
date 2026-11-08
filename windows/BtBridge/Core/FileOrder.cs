@@ -21,13 +21,36 @@ public static class FileOrder
         return RecentFirst.Contains(name) ? ("date", true) : ("name", false);
     }
 
+    /// <summary>
+    /// Whether folders come before files when the user hasn't chosen: in folders that collect new files (Downloads)
+    /// everything is mixed by date, as File Explorer shows them; elsewhere folders first.
+    /// </summary>
+    public static bool DefaultFoldersFirst(string path)
+    {
+        var name = path.TrimEnd('\\', '/').Split('\\', '/').LastOrDefault()?.ToLowerInvariant() ?? "";
+        return !RecentFirst.Contains(name);
+    }
+
     [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
     private static extern int StrCmpLogicalW(string a, string b);
 
     public static readonly IComparer<string> Natural = Comparer<string>.Create((a, b) => StrCmpLogicalW(a, b));
 
-    public static List<RemoteItem> Sort(IEnumerable<RemoteItem> items, string by, bool desc)
+    public static List<RemoteItem> Sort(IEnumerable<RemoteItem> items, string by, bool desc, bool foldersFirst = true)
     {
+        if (!foldersFirst)
+        {
+            // Folders and files together, in the chosen order (folders count as size 0).
+            IOrderedEnumerable<RemoteItem> all = by switch
+            {
+                "date" => desc ? items.OrderByDescending(i => i.Mtime) : items.OrderBy(i => i.Mtime),
+                "size" => desc ? items.OrderByDescending(i => i.Size) : items.OrderBy(i => i.Size),
+                "type" => desc ? items.OrderByDescending(i => i.IsDir ? "" : Path.GetExtension(i.Name), StringComparer.OrdinalIgnoreCase)
+                               : items.OrderBy(i => i.IsDir ? "" : Path.GetExtension(i.Name), StringComparer.OrdinalIgnoreCase),
+                _ => desc ? items.OrderByDescending(i => i.Name, Natural) : items.OrderBy(i => i.Name, Natural),
+            };
+            return all.ThenBy(i => i.Name, Natural).ToList();
+        }
         IEnumerable<RemoteItem> folders = items.Where(i => i.IsDir), files = items.Where(i => !i.IsDir);
         IOrderedEnumerable<RemoteItem> Apply(IEnumerable<RemoteItem> x) => by switch
         {

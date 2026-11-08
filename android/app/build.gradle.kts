@@ -13,11 +13,11 @@ android {
 
     defaultConfig {
         applicationId = "com.btbridge.app"
-        minSdk = 29
+        minSdk = 21
         targetSdk = 34
         // בכל גרסה חדשה להגדיל את versionCode, אחרת הטלפון לא יתקין עדכון
-        versionCode = 10
-        versionName = "0.4.0"
+        versionCode = 11
+        versionName = "0.5.0"
     }
 
     // חתימה קבועה: signing/btbridge.jks + signing/keystore.properties (לגבות! בלי הקובץ אי אפשר להתקין עדכונים)

@@ -12,6 +12,7 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.VibrationEffect
@@ -46,52 +47,65 @@ object Ring {
 
     private fun startHere(ctx: Context, from: String) {
         stopHere(ctx)
-        val am = ctx.getSystemService(AudioManager::class.java)
+        val am = ctx.service<AudioManager>()
         runCatching {
-            oldVolume = am.getStreamVolume(AudioManager.STREAM_ALARM)
-            am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
+            if (am != null) {
+                oldVolume = am.getStreamVolume(AudioManager.STREAM_ALARM)
+                am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
+            }
         }
         val uri = RingtoneManager.getActualDefaultRingtoneUri(ctx, RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        player = MediaPlayer().apply {
-            setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
+        // Kept in [player] before anything can fail, so stopHere releases it and always puts the alarm volume back.
+        val mp = MediaPlayer()
+        player = mp
+        try {
+            mp.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
-            setDataSource(ctx, uri)
-            isLooping = true
-            prepare()
-            start()
+            mp.setDataSource(ctx, uri)
+            mp.isLooping = true
+            mp.prepare()
+            mp.start()
+        } catch (e: Exception) {
+            stopHere(ctx)
+            throw e
         }
         @Suppress("DEPRECATION")
         runCatching {
-            ctx.getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 600, 400), 0))
+            val v = ctx.service<Vibrator>()
+            if (Build.VERSION.SDK_INT >= 26) v?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 600, 400), 0))
+            else v?.vibrate(longArrayOf(0, 600, 400), 0)
         }
         val stopIntent = PendingIntent.getBroadcast(ctx, 9, Intent(ctx, RingStopReceiver::class.java).setAction(STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val n = Notification.Builder(ctx, App.CHANNEL_EVENTS)
+            PI_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = notificationBuilder(ctx, App.CHANNEL_EVENTS)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setContentTitle("$from מצלצל לטלפון")
             .setContentText("הקש כדי להפסיק")
             .setContentIntent(stopIntent)
             .setDeleteIntent(stopIntent)
-            .addAction(Notification.Action.Builder(null, "הפסק", stopIntent).build())
+            .addAction(notificationAction("הפסק", stopIntent))
             .setAutoCancel(true)
             .build()
-        runCatching { ctx.getSystemService(NotificationManager::class.java).notify(NOTIF_ID, n) }
+        runCatching { ctx.service<NotificationManager>()?.notify(NOTIF_ID, n) }
         val mine = ++token
         main.postDelayed({ if (token == mine) stopHere(ctx) }, 30_000)
     }
 
     private fun stopHere(ctx: Context) {
-        val p = player ?: return
+        val p = player
         player = null
-        runCatching { p.stop() }
-        runCatching { p.release() }
-        runCatching { ctx.getSystemService(Vibrator::class.java)?.cancel() }
+        if (p != null) {
+            runCatching { p.stop() }
+            runCatching { p.release() }
+            runCatching { ctx.service<Vibrator>()?.cancel() }
+        }
+        // Even when the sound never started (it couldn't be loaded): the alarm volume goes back to what it was.
         if (oldVolume >= 0) runCatching {
-            ctx.getSystemService(AudioManager::class.java).setStreamVolume(AudioManager.STREAM_ALARM, oldVolume, 0)
+            ctx.service<AudioManager>()?.setStreamVolume(AudioManager.STREAM_ALARM, oldVolume, 0)
         }
         oldVolume = -1
-        runCatching { ctx.getSystemService(NotificationManager::class.java).cancel(NOTIF_ID) }
+        if (p != null) runCatching { ctx.service<NotificationManager>()?.cancel(NOTIF_ID) }
     }
 }
 
@@ -219,7 +233,7 @@ object ClipSend {
     }
 
     fun current(ctx: Context): String? = runCatching {
-        ctx.getSystemService(ClipboardManager::class.java)?.primaryClip?.takeIf { it.itemCount > 0 }
+        ctx.service<ClipboardManager>()?.primaryClip?.takeIf { it.itemCount > 0 }
             ?.getItemAt(0)?.coerceToText(ctx)?.toString()
     }.getOrNull()
 }

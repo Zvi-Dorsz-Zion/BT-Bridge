@@ -8,7 +8,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,11 +27,14 @@ class BridgeService : Service() {
         private const val ID = 1
         @Volatile private var instance: BridgeService? = null
 
-        fun start(ctx: Context) = ctx.startForegroundService(Intent(ctx, BridgeService::class.java))
+        /** startForegroundService on Android 8.0+, a plain startService before it. */
+        fun start(ctx: Context) = ContextCompat.startForegroundService(ctx, Intent(ctx, BridgeService::class.java))
 
         /** Android 10+ needs a "media projection" foreground service before screen capture starts. */
         fun promoteForProjection(ctx: Context) {
             val s = instance ?: return
+            // Before Android 10 there are no service types: the service is already in the foreground.
+            if (Build.VERSION.SDK_INT < 29) return
             s.startForeground(ID, s.build(s.text),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         }
@@ -40,16 +45,30 @@ class BridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        var foreground = false
         try {
-            startForeground(ID, build(text), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            if (Build.VERSION.SDK_INT >= 29) startForeground(ID, build(text), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            else startForeground(ID, build(text))
+            foreground = true
         } catch (e: Exception) {
             // Android 14+ refuses this service type until the Bluetooth permission is granted.
             com.btbridge.app.core.Log.w("startForeground: ${e.message}")
         }
+        if (!foreground && Build.VERSION.SDK_INT >= 29) {
+            // Try once more without a type.
+            try {
+                startForeground(ID, build(text))
+                foreground = true
+            } catch (e: Exception) {
+                com.btbridge.app.core.Log.w("startForeground without a type: ${e.message}")
+            }
+        }
+        // Never stay "started but not in the foreground": Android would kill the app for it. The app still works while open.
+        if (!foreground) stopSelf()
 
         val b = App.bridge
         b.start()
-        val nm = getSystemService(NotificationManager::class.java)
+        val nm = service<NotificationManager>()!!
         scope.launch {
             b.sessions.collect { list ->
                 text = if (list.isEmpty()) "מוכן לחיבורים" else "מחובר ל: " + list.joinToString(", ") { b.displayName(it) }
@@ -69,7 +88,7 @@ class BridgeService : Service() {
                     val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
                     PendingIntent.getActivity(this@BridgeService, n,
                         Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                        PendingIntent.FLAG_IMMUTABLE)
+                        PI_IMMUTABLE)
                 }.getOrNull() ?: openApp()
                 val msg = if (r.update) "התקבל עדכון לגשר בלוטוס מ-${r.from}. הקש כדי להתקין." else "התקבל ${file.name} מ-${r.from}"
                 runCatching { nm.notify(n++, event(msg, open)) }
@@ -87,10 +106,10 @@ class BridgeService : Service() {
     }
 
     private fun openApp(): PendingIntent = PendingIntent.getActivity(
-        this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        this, 0, Intent(this, MainActivity::class.java), PI_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
     private fun event(msg: String, intent: PendingIntent): Notification =
-        Notification.Builder(this, App.CHANNEL_EVENTS)
+        notificationBuilder(this, App.CHANNEL_EVENTS)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("גשר בלוטוס")
             .setContentText(msg)
@@ -101,14 +120,14 @@ class BridgeService : Service() {
 
     private fun build(text: String): Notification {
         val clip = PendingIntent.getActivity(this, 5,
-            Intent(this, ClipSendActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, App.CHANNEL_SERVICE)
+            Intent(this, ClipSendActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PI_IMMUTABLE)
+        return notificationBuilder(this, App.CHANNEL_SERVICE)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("גשר בלוטוס")
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(openApp())
-            .apply { if (App.bridge.store.shareClipboard) addAction(Notification.Action.Builder(null, "שלח את הלוח למחשב", clip).build()) }
+            .apply { if (App.bridge.store.shareClipboard) addAction(notificationAction("שלח את הלוח למחשב", clip)) }
             .build()
     }
 }

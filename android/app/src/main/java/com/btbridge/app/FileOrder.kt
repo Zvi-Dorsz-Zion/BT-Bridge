@@ -17,6 +17,15 @@ object FileOrder {
         return if (name in recentFirst) "date" to true else "name" to false
     }
 
+    /**
+     * Folders first, or folders and files together. Folders that collect new files (newest first) are mixed by
+     * default, like the Windows file manager sorted by date; everywhere else folders come first.
+     */
+    fun defaultFoldersFirst(path: String): Boolean {
+        val name = path.trimEnd('\\', '/').split('\\', '/').lastOrNull()?.lowercase() ?: ""
+        return name !in recentFirst
+    }
+
     /** Natural order: digit runs compare as numbers, the rest case-insensitively. */
     val natural = Comparator<String> { a, b ->
         var i = 0
@@ -44,15 +53,18 @@ object FileOrder {
         (a.length - i) - (b.length - j)
     }
 
-    fun sort(items: List<RemoteItem>, by: String, desc: Boolean): List<RemoteItem> {
+    /** [foldersFirst] false: folders and files together, by the same key (a folder counts as size 0), ties by name. */
+    fun sort(items: List<RemoteItem>, by: String, desc: Boolean, foldersFirst: Boolean = true): List<RemoteItem> {
         val byName = compareBy(natural) { it: RemoteItem -> it.name }
+        // Kotlin's then() and java.util.Collections, not Comparator.thenComparing()/reversed(): those exist only from Android 7.0.
         val cmp: Comparator<RemoteItem> = when (by) {
-            "date" -> compareBy<RemoteItem> { it.mtime }.thenComparing(byName)
-            "size" -> compareBy<RemoteItem> { it.size }.thenComparing(byName)
-            "type" -> compareBy<RemoteItem> { it.name.substringAfterLast('.', "").lowercase() }.thenComparing(byName)
+            "date" -> compareBy<RemoteItem> { it.mtime }.then(byName)
+            "size" -> compareBy<RemoteItem> { if (it.isDir) 0L else it.size }.then(byName)
+            "type" -> compareBy<RemoteItem> { it.name.substringAfterLast('.', "").lowercase() }.then(byName)
             else -> byName
         }
-        val ordered = if (desc) cmp.reversed() else cmp
+        val ordered: Comparator<RemoteItem> = if (desc) java.util.Collections.reverseOrder(cmp) else cmp
+        if (!foldersFirst) return items.sortedWith(ordered)
         val folders = items.filter { it.isDir }.sortedWith(if (by == "size") byName else ordered)
         return folders + items.filter { !it.isDir }.sortedWith(ordered)
     }

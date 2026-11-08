@@ -107,6 +107,8 @@ public sealed class AppSettings
     public bool ShareClipboard { get; set; } = true;
     /// <summary>Notifications that appear on the phone show up next to the clock here too.</summary>
     public bool ShowPhoneNotifications { get; set; } = true;
+    /// <summary>"Send to → גשר בלוטוס" in File Explorer's right-click menu.</summary>
+    public bool SendToMenu { get; set; } = true;
     /// <summary>Which browser the other device controls as "a separate browser": "edge" or "chrome" (the other one if it is missing).</summary>
     public string Browser { get; set; } = "edge";
     /// <summary>The page the separate browser opens with.</summary>
@@ -175,17 +177,25 @@ public sealed class AppSettings
 
     public static AppSettings Load()
     {
-        try
+        // The settings, or else the copy kept from the save before (a damaged file must not wipe the password and
+        // every known device without a word).
+        foreach (var f in new[] { FilePath, FilePath + ".bak" })
         {
-            if (File.Exists(FilePath))
+            try
             {
-                var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+                if (!File.Exists(f)) continue;
+                var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(f)) ?? throw new IOException("empty");
                 // Older versions used the computer's technical (English) name.
                 if (s.DeviceName == Environment.MachineName) s.DeviceName = "המחשב שלי";
+                if (f != FilePath) Log.Write("settings: loaded the backup copy");
                 return s;
             }
+            catch (Exception ex)
+            {
+                Log.Write($"settings load ({Path.GetFileName(f)}): " + ex.Message);
+                try { File.Copy(f, f + $".bad-{DateTime.Now:yyyyMMdd-HHmmss}", true); } catch { }
+            }
         }
-        catch (Exception ex) { Log.Write("settings load: " + ex.Message); }
         return new AppSettings();
     }
 
@@ -195,9 +205,38 @@ public sealed class AppSettings
         {
             Directory.CreateDirectory(Log.Dir);
             var tmp = FilePath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
-            File.Move(tmp, FilePath, true);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(this, new JsonSerializerOptions { WriteIndented = true });
+            // Written all the way to the disk before it replaces the old file, so a power cut can't leave it half written.
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes);
+                fs.Flush(true);
+            }
+            try
+            {
+                if (File.Exists(FilePath)) File.Replace(tmp, FilePath, FilePath + ".bak", ignoreMetadataErrors: true);
+                else File.Move(tmp, FilePath);
+            }
+            catch (IOException) { File.Move(tmp, FilePath, true); } // e.g. another program holds the old file: as before
         }
+    }
+
+    /// <summary>Save for background threads (connecting): a failed write is logged and must not fail the connection.</summary>
+    private void SaveQuietly()
+    {
+        try { Save(); }
+        catch (Exception ex) { Log.Write("settings save: " + ex.Message); }
+    }
+
+    public bool TryGetSort(string key, out string value)
+    {
+        lock (Gate) return Sorts.TryGetValue(key, out value!);
+    }
+
+    public void SetSort(string key, string value)
+    {
+        lock (Gate) Sorts[key] = value;
+        Save();
     }
 
     // ---------------------------------------------------------------- password
@@ -239,7 +278,7 @@ public sealed class AppSettings
             Trusted.RemoveAll(t => t.Fp == fp || (address.Length > 0 && t.Address == address));
             Trusted.Add(new TrustedDevice { Fp = fp, Pub = Crypto.B64(pub), Name = name, Address = address, Os = os });
         }
-        Save();
+        SaveQuietly();
     }
 
     /// <summary>Keeps name/address of an already trusted device current.</summary>
@@ -253,12 +292,29 @@ public sealed class AppSettings
             if (t.Name != name) { t.Name = name; changed = true; }
             if (address.Length > 0 && t.Address != address) { t.Address = address; changed = true; }
         }
-        if (changed) Save();
+        if (changed) SaveQuietly();
     }
 
     public void Forget(string fp)
     {
         lock (Gate) Trusted.RemoveAll(t => t.Fp == fp);
+        Save();
+    }
+
+    /// <summary>"Remove device": forgets it and everything kept for it here (nickname, saved places, sort choices).</summary>
+    public void RemoveDevice(string fp, string address)
+    {
+        lock (Gate)
+        {
+            Trusted.RemoveAll(t => (fp.Length > 0 && t.Fp == fp) || (address.Length > 0 && t.Address == address));
+            foreach (var key in new[] { fp, address }.Where(k => k.Length > 0))
+            {
+                Nicknames.Remove(key);
+                Saved.Remove(key);
+            }
+            if (fp.Length > 0)
+                foreach (var k in Sorts.Keys.Where(k => k.StartsWith(fp + "|", StringComparison.Ordinal)).ToList()) Sorts.Remove(k);
+        }
         Save();
     }
 }

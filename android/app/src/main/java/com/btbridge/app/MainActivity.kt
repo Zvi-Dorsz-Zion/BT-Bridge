@@ -91,7 +91,15 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.btbridge.app.core.Session
 import com.btbridge.app.core.Transfer
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -179,17 +187,55 @@ private fun AppRoot(resumed: Int) {
 
 // ---------------------------------------------------------------------- permissions
 
-private fun granted(ctx: Context, p: String) = ctx.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+/** Before Android 6.0 every permission is given at install, and this says so. */
+private fun granted(ctx: Context, p: String) = ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
 
-fun allFilesGranted() = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
+/** Access to all the phone's files ([AndroidStore.allFiles]). */
+fun allFilesGranted() = App.bridge.store.allFiles
+
+/** Asks for [allFilesGranted]: a settings page on Android 11+, the storage permission ([askStorage]) before it. */
+fun askAllFiles(ctx: Context, askStorage: () -> Unit) {
+    if (Build.VERSION.SDK_INT >= 30) ctx.startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + ctx.packageName)))
+    else askStorage()
+}
+
+/**
+ * A launcher for one runtime permission. When Android no longer shows its question (refused for good before, so the
+ * answer comes back at once), [fallback] opens the settings page where it can still be allowed.
+ */
+@Composable
+private fun rememberPermissionAsk(permission: String, fallback: (Context) -> Unit): () -> Unit {
+    val ctx = LocalContext.current
+    val askedAt = remember { longArrayOf(0) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (!ok && System.currentTimeMillis() - askedAt[0] < 400) runCatching { fallback(ctx) }
+    }
+    return {
+        askedAt[0] = System.currentTimeMillis()
+        launcher.launch(permission)
+    }
+}
+
+private fun openAppDetails(ctx: Context) =
+    ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName)))
+
+/** Android 10 and older: the storage permission, asked at runtime from 6.0 (the manifest has it up to 10). */
+@Composable
+private fun rememberStorageAsk(): () -> Unit = rememberPermissionAsk(Manifest.permission.WRITE_EXTERNAL_STORAGE, ::openAppDetails)
 
 fun locationOn(ctx: Context): Boolean =
-    ctx.getSystemService(LocationManager::class.java)?.isLocationEnabled == true
+    ctx.service<LocationManager>()?.let { LocationManagerCompat.isLocationEnabled(it) } == true
+
+/** Android 6.0+ can stop apps in the background to save battery; before it nothing needs allowing. */
+fun batteryUnrestricted(ctx: Context): Boolean =
+    Build.VERSION.SDK_INT < 23 || ctx.service<PowerManager>()?.isIgnoringBatteryOptimizations(ctx.packageName) == true
 
 /** Android 10-11 need location for Bluetooth search and for the direct network; 12+ have their own permissions. */
 fun nearbyPermissions(): Array<String> = when {
     Build.VERSION.SDK_INT >= 33 -> arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.NEARBY_WIFI_DEVICES)
-    Build.VERSION.SDK_INT >= 31 -> arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION)
+    // Android 12 asks for the precise location only together with the approximate one.
+    Build.VERSION.SDK_INT >= 31 -> arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT,
+        Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
     else -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
 }
 
@@ -213,12 +259,18 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
     var message by remember { mutableStateOf<String?>(null) }
     var menuFor by remember { mutableStateOf<DeviceRow?>(null) }
     var renaming by remember { mutableStateOf<DeviceRow?>(null) }
+    var removing by remember { mutableStateOf<RemoveTarget?>(null) }
     var showOthers by remember { mutableStateOf(false) }
 
     val btPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val askStorage = rememberStorageAsk()
     LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= 33) notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        // Asked once here; later only from the permissions page in the settings.
+        if (Build.VERSION.SDK_INT >= 33 && !b.store.notificationsAsked && !granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
+            b.store.notificationsAsked = true
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     val (mine, others) = remember(sessions, storeVersion, resumed, status) {
@@ -302,7 +354,7 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
             }
             if (!allFilesGranted()) item {
                 Notice("כדי שהמחשב יראה את כל הקבצים בטלפון, ושההורדות יישמרו בתיקיית ההורדות, צריך לאשר \"גישה לכל הקבצים\".", "אשר") {
-                    ctx.startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + ctx.packageName)))
+                    askAllFiles(ctx, askStorage)
                 }
             }
             if (showMissing) item {
@@ -346,6 +398,10 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
                         b.store.forget(r.fp)
                         menuFor = null
                     }) { Text("שכח מכשיר (בפעם הבאה תידרש סיסמה)") }
+                    TextButton(onClick = {
+                        removing = RemoveTarget(r.fp, r.key, r.name, r.device != null)
+                        menuFor = null
+                    }) { Text("הסר מכשיר מהרשימה…") }
                 }
             },
             confirmButton = { TextButton(onClick = { menuFor = null }) { Text("סגור") } },
@@ -366,6 +422,7 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
             dismissButton = { TextButton(onClick = { renaming = null }) { Text("ביטול") } },
         )
     }
+    removing?.let { RemoveDeviceDialogs(it) { removing = null } }
     message?.let { MessageDialog(it) { message = null } }
     if (identityNotice) MessageDialog("המפתח של הטלפון לא נטען, ולכן נוצר מפתח חדש. המכשירים המוכרים יבקשו את הסיסמה פעם אחת.") {
         identityNotice = false
@@ -377,9 +434,10 @@ private fun HomeScreen(resumed: Int, onOpen: (Session) -> Unit, onTransfers: () 
 private fun missingOptional(ctx: Context): List<String> {
     val b = App.bridge
     val out = mutableListOf<String>()
-    if (!BridgeAccessibility.isEnabled(ctx)) out += "שליטה מהמחשב"
-    if (b.store.directMode != "off" && !nearbyGranted(ctx)) out += "מיקום (לרשת ישירה)"
-    if (!ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) out += "פעולה ברקע"
+    // Control from the computer needs Android 7.0, the direct network 8.0: on older phones there is nothing to allow.
+    if (BridgeAccessibility.gesturesSupported && !BridgeAccessibility.isEnabled(ctx)) out += "שליטה מהמחשב"
+    if (DirectHotspot.supported && b.store.directMode != "off" && !nearbyGranted(ctx)) out += "מיקום (לרשת ישירה)"
+    if (!batteryUnrestricted(ctx)) out += "פעולה ברקע"
     if (b.store.forwardNotifications && !BridgeNotifications.isEnabled(ctx)) out += "התראות הטלפון במחשב"
     return out
 }
@@ -403,6 +461,79 @@ private fun Notice(text: String, action: String, secondary: String? = null, onSe
 fun MessageDialog(text: String, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, text = { Text(text) },
         confirmButton = { TextButton(onClick = onDismiss) { Text("אישור") } })
+}
+
+// ---------------------------------------------------------------------- remove device
+
+/** A device to remove: [fp] is empty for a paired device that never connected; [key] is its Bluetooth address key. */
+private class RemoveTarget(val fp: String, val key: String, val name: String, val paired: Boolean)
+
+/** "Remove device": asks, removes it ([Bridge.removeDevice]), then offers to cancel the Bluetooth pairing too. */
+@Composable
+private fun RemoveDeviceDialogs(t: RemoveTarget, onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    var askUnpair by remember(t) { mutableStateOf(false) }
+    if (!askUnpair) AlertDialog(
+        onDismissRequest = onDone,
+        title = { Text("להסיר את ${t.name} מהרשימה?") },
+        text = {
+            Text(if (t.fp.isNotEmpty()) "החיבור אליו ייסגר, והכינוי, השמורים והמיון שלו יימחקו. בפעם הבאה שיתחבר תידרש סיסמה."
+                else "הכינוי שלו יימחק.")
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val b = App.bridge
+                b.runInBackground { runCatching { b.removeDevice(t.fp, t.key) } }
+                if (t.paired) askUnpair = true else onDone()
+            }) { Text("הסר") }
+        },
+        dismissButton = { TextButton(onClick = onDone) { Text("ביטול") } },
+    ) else AlertDialog(
+        onDismissRequest = onDone,
+        title = { Text("לבטל גם את הצימוד בבלוטוס?") },
+        text = { Text("אחרי ביטול הצימוד המכשיר ייעלם גם מ\"מזווגים נוספים\". כדי להתחבר אליו שוב יהיה צריך לצמד מחדש.") },
+        confirmButton = { TextButton(onClick = { onDone(); unpair(ctx, t.key) }) { Text("בטל צימוד") } },
+        dismissButton = { TextButton(onClick = onDone) { Text("השאר צימוד") } },
+    )
+}
+
+/**
+ * Cancels the Bluetooth pairing (BluetoothDevice.removeBond is hidden, so through reflection). When Android refuses,
+ * opens the Bluetooth settings, where the user can do it.
+ */
+@SuppressLint("MissingPermission", "DiscouragedPrivateApi")
+private fun unpair(ctx: Context, key: String) {
+    val b = App.bridge
+    val app = ctx.applicationContext
+    val main = android.os.Handler(android.os.Looper.getMainLooper())
+    b.runInBackground {
+        val ok = try {
+            if (!b.hasBtPermission()) false
+            else {
+                val d = b.adapter()?.bondedDevices?.firstOrNull { Bridge.key(it.address) == key }
+                if (d == null) true
+                else {
+                    val started = d.javaClass.getMethod("removeBond").invoke(d) as? Boolean == true
+                    // The pairing goes away a moment later; then the lists refresh.
+                    if (started) repeat(20) { if (d.bondState == BluetoothDevice.BOND_BONDED) Thread.sleep(250) }
+                    started
+                }
+            }
+        } catch (e: Exception) {
+            com.btbridge.app.core.Log.w("removeBond: $e")
+            false
+        }
+        main.post {
+            runCatching {
+                b.store.version.update { it + 1 }
+                if (ok) android.widget.Toast.makeText(app, "הצימוד בוטל", android.widget.Toast.LENGTH_SHORT).show()
+                else {
+                    android.widget.Toast.makeText(app, "לא הצלחתי לבטל את הצימוד. אפשר לבטל אותו כאן, בהגדרות הבלוטוס.", android.widget.Toast.LENGTH_LONG).show()
+                    app.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------- search and pair
@@ -568,6 +699,16 @@ private fun TransfersScreen(onBack: () -> Unit) {
     val b = App.bridge
     val list by b.transfers.collectAsState()
     BackHandler(onBack = onBack)
+    // Downloaded files that were deleted since leave the list: right when the app comes back, and every few seconds.
+    val owner = LocalContext.current as? LifecycleOwner
+    LaunchedEffect(owner) {
+        owner?.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (isActive) {
+                runCatching { withContext(Dispatchers.IO) { b.dropGoneDownloads() } }
+                delay(3000)
+            }
+        }
+    }
     Scaffold(topBar = {
         TopAppBar(title = { Text("העברות") },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "חזור") } },
@@ -626,7 +767,7 @@ fun friendlyPath(p: String): String {
 // ---------------------------------------------------------------------- settings
 
 @OptIn(ExperimentalMaterial3Api::class)
-@SuppressLint("BatteryLife")
+@SuppressLint("BatteryLife", "MissingPermission")
 @Composable
 private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
     val b = App.bridge
@@ -635,6 +776,12 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
     var name by remember { mutableStateOf(b.store.deviceName) }
     var changingPw by remember { mutableStateOf(false) }
     val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    // When Android no longer shows the question (refused before), the app's notification settings open instead.
+    val askNotifications = rememberPermissionAsk(Manifest.permission.POST_NOTIFICATIONS) { c ->
+        if (Build.VERSION.SDK_INT >= 26) c.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, c.packageName))
+    }
+    val askStorage = rememberStorageAsk()
+    var removing by remember { mutableStateOf<RemoveTarget?>(null) }
     BackHandler(onBack = onBack)
     if (changingPw) {
         BackHandler { changingPw = false }
@@ -651,6 +798,15 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
                 Text(detail, style = MaterialTheme.typography.bodySmall)
             }
             if (!ok) TextButton(onClick = action) { Text("אשר") }
+        }
+    }
+
+    /** Something this Android version doesn't have: shown greyed, with the reason. */
+    @Composable
+    fun NotHere(title: String, detail: String) {
+        Column(Modifier.fillMaxWidth()) {
+            Text("– $title", fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 
@@ -696,9 +852,13 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
             Text("תיקיית הורדות: " + if (allFilesGranted()) "הורדות ← גשר בלוטוס" else "תיקייה פנימית של האפליקציה (אשר \"גישה לכל הקבצים\" כדי לשמור בהורדות)", style = MaterialTheme.typography.bodySmall)
 
             HorizontalDivider()
-            Toggle("לאפשר שליטה בטלפון", "מכשירים מוכרים יכולים לצפות במסך ולשלוט בו", b.store.allowControl) { b.store.allowControl = it }
-            Toggle("רשת ישירה", "כשאין רשת משותפת, לפתוח נקודה חמה זמנית למחשב (להעברות גדולות ולשליטה). נסגרת לבד אחרי 90 שניות בלי שימוש.",
+            Toggle("לאפשר שליטה בטלפון",
+                if (BridgeAccessibility.gesturesSupported) "מכשירים מוכרים יכולים לצפות במסך ולשלוט בו"
+                else "מכשירים מוכרים יכולים לצפות במסך. שליטה מהמחשב דורשת אנדרואיד 7 ומעלה.",
+                b.store.allowControl) { b.store.allowControl = it }
+            if (DirectHotspot.supported) Toggle("רשת ישירה", "כשאין רשת משותפת, לפתוח נקודה חמה זמנית למחשב (להעברות גדולות ולשליטה). נסגרת לבד אחרי 90 שניות בלי שימוש.",
                 b.store.directMode != "off") { b.store.directMode = if (it) "auto" else "off" }
+            else NotHere("רשת ישירה", "דורשת אנדרואיד 8 ומעלה. בטלפון הזה החיבור המהיר עובד רק כשהטלפון והמחשב באותה רשת וויפי.")
             Toggle("לוח הדבקה משותף", "טקסט שמעתיקים במחשב אפשר להדביק בטלפון. מהטלפון למחשב: כשפותחים את האפליקציה, " +
                 "או בכפתור \"שלח את הלוח למחשב\" בהתראה של גשר בלוטוס (אנדרואיד לא מרשה לקרוא את הלוח ברקע).",
                 b.store.shareClipboard) { b.store.shareClipboard = it }
@@ -707,25 +867,29 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
 
             HorizontalDivider()
             Text("הרשאות", fontWeight = FontWeight.SemiBold)
-            Perm("גישה לכל הקבצים", "כדי שהמחשב יראה את כל הקבצים", allFilesGranted()) {
-                ctx.startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + ctx.packageName)))
+            Perm(if (Build.VERSION.SDK_INT >= 30) "גישה לכל הקבצים" else "גישה לקבצים", "כדי שהמחשב יראה את כל הקבצים", allFilesGranted()) {
+                askAllFiles(ctx, askStorage)
             }
-            Perm("שליטה מהמחשב (נגישות)", "הגדרות ← נגישות ← גשר בלוטוס ← הפעל. בלי זה המחשב רק רואה את המסך.", BridgeAccessibility.isEnabled(ctx)) {
+            if (BridgeAccessibility.gesturesSupported) Perm("שליטה מהמחשב (נגישות)", "הגדרות ← נגישות ← גשר בלוטוס ← הפעל. בלי זה המחשב רק רואה את המסך.", BridgeAccessibility.isEnabled(ctx)) {
                 ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
-            Perm("מיקום (לרשת ישירה ולחיפוש מכשירים)",
+            else NotHere("שליטה מהמחשב", "דורשת אנדרואיד 7 ומעלה. בטלפון הזה המחשב יכול רק לצפות במסך.")
+            Perm(if (DirectHotspot.supported) "מיקום (לרשת ישירה ולחיפוש מכשירים)" else "מיקום (לחיפוש מכשירים)",
                 if (Build.VERSION.SDK_INT < 31) "בחלון האישור בחר \"בזמן השימוש באפליקציה\" ולא \"רק הפעם\", אחרת תתבקש לאשר שוב בכל פעם. " +
                     "באנדרואיד 11 צריך גם שהמיקום יהיה דלוק בזמן השימוש." else "",
                 nearbyGranted(ctx)) { perms.launch(nearbyPermissions()) }
+            if (Build.VERSION.SDK_INT >= 33) Perm("התראות של גשר בלוטוס", "כדי לראות כשמגיע קובץ ומה מצב החיבור",
+                granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) { askNotifications() }
             Perm("גישה להתראות", "כדי שהתראות הטלפון יופיעו במחשב", BridgeNotifications.isEnabled(ctx)) {
-                runCatching { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+                // Android 5.0 has no direct page for it: it sits under "security" there.
+                runCatching { ctx.startActivity(Intent(if (Build.VERSION.SDK_INT >= 22) Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS else Settings.ACTION_SECURITY_SETTINGS)) }
             }
-            Perm("פעולה ברקע בלי הגבלה", "כדי שהחיבור לא ינותק כשהמסך כבוי",
-                ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) {
-                runCatching { ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + ctx.packageName))) }
+            // Both are always allowed before Android 6.0 / 8.0, so their buttons appear only on newer phones.
+            Perm("פעולה ברקע בלי הגבלה", "כדי שהחיבור לא ינותק כשהמסך כבוי", batteryUnrestricted(ctx)) {
+                if (Build.VERSION.SDK_INT >= 23) runCatching { ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + ctx.packageName))) }
             }
-            Perm("התקנת אפליקציות", "כדי להתקין אפליקציות שנשלחו מהמחשב", ctx.packageManager.canRequestPackageInstalls()) {
-                ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + ctx.packageName)))
+            Perm("התקנת אפליקציות", "כדי להתקין אפליקציות שנשלחו מהמחשב", LocalFiles.canInstallApps(ctx)) {
+                if (Build.VERSION.SDK_INT >= 26) ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + ctx.packageName)))
             }
 
             HorizontalDivider()
@@ -738,7 +902,17 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
                         Text(b.store.nameFor(t.fp, t.name))
                         Text(com.btbridge.app.core.Crypto.fingerprintDigits(t.fp), style = MaterialTheme.typography.bodySmall)
                     }
-                    TextButton(onClick = { b.store.forget(t.fp) }) { Text("הסר") }
+                    TextButton(onClick = {
+                        // Like "forget device" on the home screen: its open connection closes too.
+                        b.sessionFor(t.fp)?.let { s -> b.runInBackground { runCatching { s.close() } } }
+                        b.store.forget(t.fp)
+                    }) { Text("הסר") }
+                    TextButton(onClick = {
+                        val paired = b.hasBtPermission() && runCatching {
+                            b.adapter()?.bondedDevices?.any { Bridge.key(it.address) == t.address }
+                        }.getOrNull() == true
+                        removing = RemoveTarget(t.fp, t.address, b.store.nameFor(t.fp, t.name), paired)
+                    }) { Text("הסר מהרשימה…") }
                 }
             }
             HorizontalDivider()
@@ -746,4 +920,5 @@ private fun SettingsScreen(resumed: Int, onBack: () -> Unit) {
             Text("גרסה ${com.btbridge.app.core.AppInfo.version}", style = MaterialTheme.typography.bodySmall)
         }
     }
+    removing?.let { RemoveDeviceDialogs(it) { removing = null } }
 }

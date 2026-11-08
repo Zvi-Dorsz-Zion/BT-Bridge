@@ -62,7 +62,8 @@ public static class RemoteFs
     public static Task RenameAsync(Session s, string from, string to) =>
         s.RequestAsync(new JsonObject { ["op"] = "rename", ["from"] = from, ["to"] = to });
 
-    public static Task DeleteAsync(Session s, IEnumerable<string> paths)
+    /// <summary>Returns the answer: "recycled" says whether everything went to a recycle bin.</summary>
+    public static Task<JsonObject> DeleteAsync(Session s, IEnumerable<string> paths)
     {
         var arr = new JsonArray();
         foreach (var p in paths) arr.Add(p);
@@ -247,10 +248,16 @@ public sealed class Transfer : INotifyPropertyChanged
     {
         long size = 0;
         try { size = new FileInfo(path).Length; } catch { }
-        var t = new Transfer { Name = name, _localPath = path, _status = status, _active = false };
+        var t = new Transfer { Name = name, _localPath = path, _status = status, _active = false, Completed = true };
         t._total = t._done = size;
         return t;
     }
+
+    /// <summary>Finished successfully (its file is here, or on the other side for an upload).</summary>
+    public bool Completed { get; set; }
+
+    /// <summary>A file that came here and was deleted since: nothing left to open, so it leaves the list.</summary>
+    public bool Gone => Completed && !Upload && !_active && _localPath != null && !File.Exists(_localPath);
 
     public double Percent => Total > 0 ? Math.Min(100, Done * 100.0 / Total) : 0;
     public string Status { get => _status; set { _status = value; OnChanged(); OnChanged(nameof(CanResume)); } }

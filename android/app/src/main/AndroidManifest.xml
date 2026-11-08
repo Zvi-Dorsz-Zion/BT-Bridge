@@ -11,6 +11,8 @@
         android:usesPermissionFlags="neverForLocation" tools:targetApi="s" />
     <!-- Android 10-11: searching for new devices, and opening the direct network (temporary hotspot) -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
+    <!-- Android 12 gives the precise location only when the approximate one is asked for with it -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" tools:targetApi="tiramisu" />
 
@@ -78,6 +80,7 @@
             android:exported="true"
             android:label="שלח למחשב"
             android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:theme="@android:style/Theme.Material.Light.Dialog.NoActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -96,6 +99,8 @@
             android:name=".ProjectionActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- Keeps Bluetooth listening and connections alive in the background -->

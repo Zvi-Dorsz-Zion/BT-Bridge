@@ -82,6 +82,12 @@ public partial class MainWindow : Window
         timer.Tick += (_, _) => { foreach (var t in _transfers) t.Tick(); };
         timer.Start();
 
+        // Files that came here and were deleted since leave the list (checked every few seconds, and when the window comes back).
+        var gone = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+        gone.Tick += (_, _) => DropGoneTransfers();
+        gone.Start();
+        Activated += (_, _) => DropGoneTransfers();
+
         Loaded += async (_, _) => await LoadPaired();
         Closing += OnClosing;
         Drop += (_, e) => FileList_Drop(this, e);
@@ -248,11 +254,21 @@ public partial class MainWindow : Window
         ShowVersionNotice(d.Session);
         if (_current != d.Session)
         {
+            // The same device came back (a new connection after a drop): stay in the folder the user was in.
+            bool same = d.Session.PeerFp == _shownFp && _path.Length > 0;
             _current = d.Session;
-            _history.Clear();
-            _ = Navigate("", remember: false);
+            _shownFp = d.Session.PeerFp;
+            if (same) _ = Navigate(_path, remember: false, quiet: true);
+            else
+            {
+                _history.Clear();
+                _ = Navigate("", remember: false);
+            }
         }
     }
+
+    /// <summary>The device whose files were shown last (kept while it is disconnected).</summary>
+    private string _shownFp = "";
 
     private async void Connect_Click(object sender, RoutedEventArgs e) => await ConnectSelected();
 
@@ -292,6 +308,34 @@ public partial class MainWindow : Window
         d.Session?.Close();
         if (d.Fp.Length > 0) _b.Settings.Forget(d.Fp);
         RenderDevices();
+    }
+
+    /// <summary>
+    /// "Remove device": forgets it with everything kept for it (nickname, saved places, sort choices), and offers to
+    /// remove the Bluetooth pairing too, so it leaves the list altogether.
+    /// </summary>
+    private async void RemoveDevice_Click(object sender, RoutedEventArgs e)
+    {
+        if (Selected is not { } d) return;
+        if (MessageBox.Show($"להסיר את \"{d.Name}\" מהרשימה?\nהמחשב ישכח אותו, את הכינוי שלו ואת המקומות השמורים בו. בחיבור הבא תידרש סיסמה.",
+                "הסרת מכשיר", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No,
+                MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign) != MessageBoxResult.Yes) return;
+        d.Session?.Close();
+        _b.Settings.RemoveDevice(d.Fp, d.Key);
+        if (d.Address is { } addr && MessageBox.Show("לבטל גם את הצימוד בבלוטוס בין המחשב למכשיר?\nאחר כך, כדי להתחבר שוב, צריך לצמד מחדש.",
+                "הסרת מכשיר", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No,
+                MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign) == MessageBoxResult.Yes)
+        {
+            bool ok;
+            try { ok = await Task.Run(() => InTheHand.Net.Bluetooth.BluetoothSecurity.RemoveDevice(addr)); }
+            catch (Exception ex) { Log.Write("unpair: " + ex.Message); ok = false; }
+            if (!ok)
+            {
+                Info("לא הצלחתי לבטל את הצימוד מכאן. ייפתחו הגדרות הבלוטוס של ווינדוס: בחר שם את המכשיר ואז \"הסר התקן\".");
+                try { Process.Start(new ProcessStartInfo("ms-settings:bluetooth") { UseShellExecute = true }); } catch { }
+            }
+        }
+        await LoadPaired();
     }
 
     private async void PairNew_Click(object sender, RoutedEventArgs e)
@@ -400,21 +444,70 @@ public partial class MainWindow : Window
         if (d.ShowDialog(this) == true) await SendToInbox(s, d.FileNames);
     }
 
+    /// <summary>
+    /// Files from File Explorer's "Send to → גשר בלוטוס": to the connected device (asks which, when there are several).
+    /// When nothing is connected yet (the program was just started by it), waits a little for the usual reconnect.
+    /// </summary>
+    public async Task SendFromShell(IReadOnlyList<string> files)
+    {
+        try
+        {
+            var app = (App)Application.Current;
+            files = files.Where(f => File.Exists(f) || Directory.Exists(f)).ToList();
+            if (files.Count == 0) return;
+            var sessions = _b.Sessions.ToList();
+            if (sessions.Count == 0)
+            {
+                app.Balloon("מחכה לחיבור לטלפון כדי לשלוח…");
+                for (int i = 0; i < 40 && sessions.Count == 0; i++)
+                {
+                    await Task.Delay(500);
+                    sessions = _b.Sessions.ToList();
+                }
+            }
+            if (sessions.Count == 0)
+            {
+                app.ShowMain();
+                Info("אין מכשיר מחובר, ולכן הקבצים לא נשלחו.\nהתחבר לטלפון ונסה שוב.");
+                return;
+            }
+            var s = sessions[0];
+            if (sessions.Count > 1)
+            {
+                var w = new ChooseDeviceWindow(sessions, files.Count);
+                if (w.ShowDialog() != true || w.Chosen is not { } chosen) return;
+                s = chosen;
+            }
+            app.Balloon(files.Count == 1
+                ? $"שולח את \"{Path.GetFileName(files[0])}\" ל-{_b.DisplayName(s)}…"
+                : $"שולח {files.Count} פריטים ל-{_b.DisplayName(s)}…");
+            await SendToInbox(s, files);
+        }
+        catch (Exception ex) { Log.Write("send-to: " + ex); Err(ex, "השליחה נכשלה."); }
+    }
+
     /// <summary>"Send to device": files land in the other side's downloads folder.</summary>
     private async Task SendToInbox(Session s, IEnumerable<string> paths)
     {
-        var files = new List<(string Local, string Rel)>();
-        foreach (var p in paths)
+        var list = paths.ToList();
+        // Off the window's thread, and folders we may not read are skipped (they used to stop everything).
+        var (files, total) = await Task.Run(() =>
         {
-            if (File.Exists(p)) files.Add((p, Path.GetFileName(p)));
-            else if (Directory.Exists(p))
+            var found = new List<(string Local, string Rel)>();
+            foreach (var p in list)
             {
-                var root = Path.GetDirectoryName(p.TrimEnd('\\')) ?? p;
-                foreach (var f in Directory.EnumerateFiles(p, "*", SearchOption.AllDirectories))
-                    files.Add((f, Path.GetRelativePath(root, f).Replace('\\', '/')));
+                if (File.Exists(p)) found.Add((p, Path.GetFileName(p)));
+                else if (Directory.Exists(p))
+                {
+                    var root = Path.GetDirectoryName(p.TrimEnd('\\')) ?? p;
+                    foreach (var f in AllFiles(p))
+                        found.Add((f, Path.GetRelativePath(root, f).Replace('\\', '/')));
+                }
             }
-        }
-        await MaybeFast(s, files.Sum(f => new FileInfo(f.Local).Length));
+            return (found, found.Sum(f => SafeLength(f.Local)));
+        });
+        try { await MaybeFast(s, total); }
+        catch (Exception ex) { Log.Write("send to device, fast link: " + ex.Message); }
         await Task.WhenAll(files.Select(f =>
         {
             Transfer t = null!;
@@ -432,7 +525,7 @@ public partial class MainWindow : Window
 
     // ---------------------------------------------------------------- browsing
 
-    private async Task Navigate(string path, bool remember = true)
+    private async Task Navigate(string path, bool remember = true, bool quiet = false)
     {
         var s = _current;
         if (s == null) return;
@@ -457,6 +550,12 @@ public partial class MainWindow : Window
             Placeholder.Text = items.Count == 0 ? "התיקייה ריקה. אפשר לגרור לכאן קבצים." : "";
             Placeholder.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
+        catch (Exception) when (quiet && s == _current && path.Length > 0)
+        {
+            // The folder is gone (or can't be read now): the list of places instead of an error.
+            _history.Clear();
+            await Navigate("", remember: false);
+        }
         catch (Exception ex)
         {
             Placeholder.Visibility = _items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -471,18 +570,36 @@ public partial class MainWindow : Window
     /// <summary>The order the user chose for this folder, or the usual one (Downloads newest first, others by name).</summary>
     private (string By, bool Desc) SortFor()
     {
-        if (_b.Settings.Sorts.TryGetValue(SortKey, out var v) && v.Split('|') is [var by, var dir]) return (by, dir == "desc");
+        if (_b.Settings.TryGetSort(SortKey, out var v) && v.Split('|') is [var by, var dir]) return (by, dir == "desc");
         return FileOrder.Default(_path);
     }
+
+    /// <summary>Folders before files, or all mixed in the chosen order: the user's choice for this folder, or the usual one.</summary>
+    private bool FoldersFirstFor() =>
+        _b.Settings.TryGetSort(SortKey + "|folders", out var v) ? v == "first" : FileOrder.DefaultFoldersFirst(_path);
+
+    private bool _showingItems;
 
     private void ShowItems(IEnumerable<RemoteItem> items)
     {
         var (by, desc) = SortFor();
+        bool ff = FoldersFirstFor();
         // Virtual root keeps the order the other side gave (quick folders, then drives).
-        var list = _path.Length == 0 ? items.ToList() : FileOrder.Sort(items, by, desc);
+        var list = _path.Length == 0 ? items.ToList() : FileOrder.Sort(items, by, desc, ff);
         SortText.Text = _path.Length == 0 ? "" : FileOrder.Label(by, desc);
+        _showingItems = true;
+        FoldersFirstBox.IsChecked = ff;
+        _showingItems = false;
+        FoldersFirstBox.Visibility = _path.Length == 0 || _search != null ? Visibility.Collapsed : Visibility.Visible;
         _items.Clear();
         foreach (var i in list) _items.Add(i);
+    }
+
+    private void FoldersFirst_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_showingItems || _path.Length == 0 || _search != null) return;
+        _b.Settings.SetSort(SortKey + "|folders", FoldersFirstBox.IsChecked == true ? "first" : "mixed");
+        ShowItems(_items.ToList());
     }
 
     private void Header_Click(object sender, RoutedEventArgs e)
@@ -492,8 +609,7 @@ public partial class MainWindow : Window
         var (curBy, curDesc) = SortFor();
         // Same column flips the direction; a new column starts the natural way (dates and sizes biggest first).
         bool desc = by == curBy ? !curDesc : by is "date" or "size";
-        _b.Settings.Sorts[SortKey] = $"{by}|{(desc ? "desc" : "asc")}";
-        _b.Settings.Save();
+        _b.Settings.SetSort(SortKey, $"{by}|{(desc ? "desc" : "asc")}");
         ShowItems(_items.ToList());
     }
 
@@ -511,16 +627,20 @@ public partial class MainWindow : Window
             await MaybeFast(s, sel.Any(i => i.IsDir) ? long.MaxValue : sel.Sum(i => i.Size));
             foreach (var i in sel)
             {
-                if (i.IsDir) await CollectFolderDownload(s, i, dir, jobs);
-                else jobs.Add(QueueDownload(s, i, Path.Combine(dir, i.Name)));
-                top.Add(Path.Combine(dir, i.Name));
+                if (i.IsDir) top.Add(await CollectFolderDownload(s, i, dir, jobs));
+                else
+                {
+                    jobs.Add(QueueReservedDownload(s, i, Path.Combine(dir, i.Name), out var local));
+                    top.Add(local);
+                }
             }
         }
         catch (Exception ex) { Err(ex); return; }
         await Task.WhenAll(jobs);
         if (jobs.OfType<Task<bool>>().Any(t => !t.Result))
         {
-            MessageBox.Show("חלק מהקבצים לא הועתקו. ראה ברשימת ההעברות.", "גשר בלוטוס");
+            MessageBox.Show("חלק מהקבצים לא הועתקו. ראה ברשימת ההעברות.", "גשר בלוטוס", MessageBoxButton.OK, MessageBoxImage.Warning,
+                MessageBoxResult.OK, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign);
             return;
         }
         Clipboard.SetFileDropList(top);
@@ -572,6 +692,7 @@ public partial class MainWindow : Window
             if (s != _current) return;
             _search = q;
             FolderColumn.Width = 280;
+            FoldersFirstBox.Visibility = Visibility.Collapsed;
             foreach (var i in items) _items.Add(i);
             SortText.Text = $"תוצאות החיפוש של \"{q}\" ב-{where}: {items.Count}" +
                             (more ? " (מוצגות רק הראשונות. כדאי לחפש בתיקייה מצומצמת יותר)" : "") + ". \"חזור\" חוזר לתיקייה.";
@@ -831,7 +952,8 @@ public partial class MainWindow : Window
     private async void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.F5) { e.Handled = true; await Navigate(_path, remember: false); }
-        else if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control && !PathBox.IsKeyboardFocusWithin) { e.Handled = true; Paste_Click(sender, e); }
+        // Ctrl+V in a text box (the path, the search box) pastes text there as usual.
+        else if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control && Keyboard.FocusedElement is not System.Windows.Controls.Primitives.TextBoxBase) { e.Handled = true; Paste_Click(sender, e); }
         else if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control && FileList.IsKeyboardFocusWithin) { e.Handled = true; Copy_Click(sender, e); }
         else if (e.SystemKey == Key.Left && Keyboard.Modifiers == ModifierKeys.Alt) { e.Handled = true; Back_Click(sender, e); }
     }
@@ -902,10 +1024,17 @@ public partial class MainWindow : Window
         var sel = SelectedItems();
         if (sel.Count == 0) return;
         var what = sel.Count == 1 ? $"\"{sel[0].Name}\"" : $"{sel.Count} פריטים";
-        var how = s.PeerOs == "windows" ? "הם יעברו לסל המיחזור במחשב השני." : "המחיקה בטלפון היא לצמיתות, בלי סל מיחזור.";
+        var how = s.PeerOs == "windows"
+            ? "הם יעברו לסל המיחזור במחשב השני (בכונן נייד או בכונן רשת אין סל מיחזור, ושם המחיקה לצמיתות)."
+            : "המחיקה בטלפון היא לצמיתות, בלי סל מיחזור.";
         if (MessageBox.Show($"למחוק את {what}?\n{how}", "מחיקה", MessageBoxButton.YesNo, MessageBoxImage.Warning,
                 MessageBoxResult.No, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign) != MessageBoxResult.Yes) return;
-        try { await RemoteFs.DeleteAsync(s, sel.Select(x => x.Path)); }
+        try
+        {
+            var res = await RemoteFs.DeleteAsync(s, sel.Select(x => x.Path));
+            if (s.PeerOs == "windows" && res["recycled"]?.GetValue<bool>() == false)
+                Info("נמחק לצמיתות, כי בכונן הזה אין סל מיחזור.");
+        }
         catch (Exception ex) { Err(ex); }
         await RefreshView();
     }
@@ -914,9 +1043,14 @@ public partial class MainWindow : Window
     private bool CheckInFolder(bool inResults = false)
     {
         if (_path.Length > 0 || (inResults && _search != null)) return true;
-        MessageBox.Show("היכנס קודם לתיקייה.", "גשר בלוטוס");
+        Info("היכנס קודם לתיקייה.");
         return false;
     }
+
+    /// <summary>A short message, right to left.</summary>
+    private static void Info(string text) =>
+        MessageBox.Show(text, "גשר בלוטוס", MessageBoxButton.OK, MessageBoxImage.Information, MessageBoxResult.OK,
+            MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign);
 
     // ---------------------------------------------------------------- transfers
 
@@ -960,6 +1094,7 @@ public partial class MainWindow : Window
                 t.Status = "מעביר…";
                 await t.Work!(s, t.Cts.Token);
                 t.Tick();
+                t.Completed = true;
                 t.Status = "הושלם ✓";
                 return true;
             }
@@ -969,6 +1104,8 @@ public partial class MainWindow : Window
                 t.Interrupted = true;
                 t.Status = "נקטע. ימשיך כשהמכשיר יתחבר שוב.";
                 Log.Write($"transfer {t.Name} interrupted: {ex.Message}");
+                // The device may already be back (noticing the drop can take seconds): then go on right away.
+                _ = Dispatcher.BeginInvoke(ResumeInterrupted, DispatcherPriority.Background);
             }
             catch (Exception ex) when (t.Attempts < 5 && (ex is OperationCanceledException || LinkErrors.Any(Heb.Of(ex).Contains)))
             {
@@ -1040,7 +1177,7 @@ public partial class MainWindow : Window
     {
         if (_current is not { } s) return;
         var sel = SelectedItems();
-        if (sel.Count == 0) { MessageBox.Show("בחר קבצים או תיקיות להורדה.", "גשר בלוטוס"); return; }
+        if (sel.Count == 0) { Info("בחר קבצים או תיקיות להורדה."); return; }
         var root = _b.Settings.DownloadDir;
         var jobs = new List<Task>();
         try
@@ -1049,23 +1186,60 @@ public partial class MainWindow : Window
             foreach (var i in sel)
             {
                 if (i.IsDir) await CollectFolderDownload(s, i, root, jobs);
-                else jobs.Add(QueueDownload(s, i, FileService.UniquePath(Path.Combine(root, i.Name))));
+                else jobs.Add(QueueReservedDownload(s, i, Path.Combine(root, i.Name), out _));
             }
         }
         catch (Exception ex) { Err(ex); }
         await Task.WhenAll(jobs);
     }
 
-    private async Task CollectFolderDownload(Session s, RemoteItem dir, string localParent, List<Task> jobs)
+    /// <summary>Names already promised to downloads that haven't finished yet (the file appears only at the end).</summary>
+    private static readonly HashSet<string> Reserved = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A free name for a new download, like <see cref="FileService.UniquePath"/>, that also skips names already given
+    /// to queued downloads: two files with the same name (search results from different folders) don't overwrite each other.
+    /// </summary>
+    private static string ReservePath(string path)
     {
-        var local = FileService.UniquePath(Path.Combine(localParent, dir.Name));
-        Directory.CreateDirectory(local);
+        lock (Reserved)
+        {
+            var dir = Path.GetDirectoryName(path)!;
+            var name = Path.GetFileNameWithoutExtension(path);
+            var ext = Path.GetExtension(path);
+            var p = path;
+            for (int i = 1; Reserved.Contains(p) || File.Exists(p) || Directory.Exists(p); i++)
+                p = Path.Combine(dir, $"{name} ({i}){ext}");
+            Reserved.Add(p);
+            return p;
+        }
+    }
+
+    /// <summary>Queues a download to a reserved name, and frees the name once the download is over.</summary>
+    private Task<bool> QueueReservedDownload(Session s, RemoteItem i, string wanted, out string local)
+    {
+        var target = local = ReservePath(wanted);
+        var job = QueueDownload(s, i, target);
+        _ = job.ContinueWith(_ => { lock (Reserved) Reserved.Remove(target); }, TaskScheduler.Default);
+        return job;
+    }
+
+    /// <summary>Queues a whole folder; returns the local folder it goes to.</summary>
+    private async Task<string> CollectFolderDownload(Session s, RemoteItem dir, string localParent, List<Task> jobs)
+    {
+        string local;
+        lock (Reserved)
+        {
+            local = FileService.UniquePath(Path.Combine(localParent, dir.Name));
+            Directory.CreateDirectory(local);
+        }
         var listing = await RemoteFs.ListAsync(s, dir.Path);
         foreach (var i in listing.Items)
         {
             if (i.IsDir) await CollectFolderDownload(s, i, local, jobs);
             else jobs.Add(QueueDownload(s, i, Path.Combine(local, i.Name)));
         }
+        return local;
     }
 
     private async void UploadFiles_Click(object sender, RoutedEventArgs e)
@@ -1129,8 +1303,9 @@ public partial class MainWindow : Window
         var jobs = new List<Task<bool>>();
         try
         {
-            long total = list.Sum(p => File.Exists(p) ? new FileInfo(p).Length
-                : Directory.Exists(p) ? Directory.EnumerateFiles(p, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length) : 0);
+            // Off the window's thread: a big folder takes a while to measure, and the link must keep reading meanwhile.
+            long total = await Task.Run(() => list.Sum(p => File.Exists(p) ? new FileInfo(p).Length
+                : Directory.Exists(p) ? AllFiles(p).Sum(f => SafeLength(f)) : 0));
             await MaybeFast(s, total);
             foreach (var p in list)
             {
@@ -1148,15 +1323,39 @@ public partial class MainWindow : Window
         var remote = RemoteFs.Join(s, remoteParent, Path.GetFileName(local.TrimEnd('\\')));
         try { await RemoteFs.MkdirAsync(s, remote); }
         catch (RemoteException ex) when (ex.Code == "exists") { }
-        foreach (var f in Directory.EnumerateFiles(local))
+        // A folder we may not read (system folders inside a user folder) is skipped instead of stopping the whole upload.
+        var (files, dirs) = await Task.Run(() => (
+            Directory.EnumerateFiles(local, "*", NoRecurse).ToList(),
+            Directory.EnumerateDirectories(local, "*", NoRecurse).ToList()));
+        foreach (var f in files)
             jobs.Add(QueueUpload(s, f, RemoteFs.Join(s, remote, Path.GetFileName(f))));
-        foreach (var d in Directory.EnumerateDirectories(local))
+        foreach (var d in dirs)
             await CollectFolderUpload(s, d, remote, jobs);
+    }
+
+    /// <summary>Like the plain enumeration (hidden files included), but folders we may not read are skipped.</summary>
+    private static readonly EnumerationOptions NoRecurse = new() { IgnoreInaccessible = true, AttributesToSkip = 0 };
+    private static readonly EnumerationOptions Recurse = new() { IgnoreInaccessible = true, AttributesToSkip = 0, RecurseSubdirectories = true };
+
+    private static IEnumerable<string> AllFiles(string dir) => Directory.EnumerateFiles(dir, "*", Recurse);
+
+    private static long SafeLength(string f)
+    {
+        try { return new FileInfo(f).Length; } catch { return 0; }
     }
 
     private void CancelTransfer_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is Transfer t) t.Cts.Cancel();
+    }
+
+    private void DropGoneTransfers()
+    {
+        try
+        {
+            foreach (var t in _transfers.Where(t => t.Gone).ToList()) _transfers.Remove(t);
+        }
+        catch (Exception ex) { Log.Write("transfers cleanup: " + ex.Message); }
     }
 
     private void ClearTransfers_Click(object sender, RoutedEventArgs e)

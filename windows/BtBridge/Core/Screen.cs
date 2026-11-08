@@ -152,6 +152,7 @@ public sealed class ScreenSource
     private volatile string _profile;
     private volatile bool _key = true;
     private readonly bool _restoreCursor;
+    private readonly int _maxW;
     private long _acked;
     private readonly AutoResetEvent _ackSignal = new(false);
 
@@ -177,6 +178,8 @@ public sealed class ScreenSource
         _monitor = req["monitor"]?.GetValue<int>() ?? -1;
         _profile = req["profile"]?.GetValue<string>() ?? "auto";
         _restoreCursor = req["restoreCursor"]?.GetValue<bool>() == true;
+        // "maxw" (0.5, optional): the widest picture the viewer can use (its screen, with room to zoom). Wider is sent for nothing.
+        _maxW = Math.Max(0, req["maxw"]?.GetValue<int>() ?? 0);
         var mons = grab.Monitors();
         if (_monitor < 0 || _monitor >= mons.Count) _monitor = Math.Max(0, mons.ToList().FindIndex(m => m.Primary));
     }
@@ -185,10 +188,12 @@ public sealed class ScreenSource
     {
         Active[(Session, Id)] = this;
         Session.ExpectCancel(Id, Stop);
-        Session.OnClosed += _ => Stop();
+        Session.OnClosed += OnSessionClosed;
         ActiveChanged?.Invoke(this, true);
         new Thread(Loop) { IsBackground = true, Name = "screen-source" }.Start();
     }
+
+    private void OnSessionClosed(Session _) => Stop();
 
     public void Stop()
     {
@@ -196,6 +201,9 @@ public sealed class ScreenSource
         _cts.Cancel();
         _ackSignal.Set();
         Active.TryRemove((Session, Id), out _);
+        // Let go of the session: otherwise every past stream stays in memory and counts as "active" for as long as it lives.
+        Session.ForgetCancel(Id);
+        Session.OnClosed -= OnSessionClosed;
         ActiveChanged?.Invoke(this, false);
         try { Owned?.Dispose(); } catch (Exception ex) { Log.Write("screen source close: " + ex.Message); }
     }
@@ -260,16 +268,20 @@ public sealed class ScreenSource
         int[]? prev = null;
         int pw = 0, ph = 0;
         long lastSent = 0;
+        int linkErrors = 0;
         try
         {
             while (!_cts.IsCancellationRequested)
             {
+              try
+              {
                 long start = Environment.TickCount64;
                 var link = Session.DataLink;
                 var prof = ScreenProfile.For(_profile, link.IsWifi);
                 var mons = _grab.Monitors();
                 var mon = mons[Math.Min(_monitor, mons.Count - 1)];
-                var (w, h) = ScreenProto.Fit(mon.W, mon.H, prof.MaxW);
+                int maxW = _maxW >= 320 ? Math.Min(prof.MaxW, _maxW) : prof.MaxW;
+                var (w, h) = ScreenProto.Fit(mon.W, mon.H, maxW);
                 var px = _grab.Grab(mon.Index, w, h);
                 if (px == null) { Thread.Sleep(500); continue; }
 
@@ -289,6 +301,17 @@ public sealed class ScreenSource
                 }
                 int wait = 1000 / prof.Fps - (int)(Environment.TickCount64 - start);
                 if (wait > 0) _cts.Token.WaitHandle.WaitOne(wait);
+                linkErrors = 0;
+              }
+              catch (IOException ex) when (!_cts.IsCancellationRequested && !Session.Closed && ++linkErrors <= 40)
+              {
+                  // The Wi-Fi link dropped or was replaced in the middle of a frame: go on over the link that is left,
+                  // starting again with a whole picture (the viewer drops the cut frame).
+                  if (linkErrors == 1) Log.Write("screen source: link changed (" + ex.Message + ")");
+                  _key = true;
+                  Interlocked.Exchange(ref _acked, seq);
+                  _cts.Token.WaitHandle.WaitOne(300);
+              }
             }
         }
         catch (Exception ex)
@@ -297,6 +320,7 @@ public sealed class ScreenSource
             if (!_cts.IsCancellationRequested) Log.Write("screen source: " + ex.Message);
         }
         Stop();
+        if (_grab is GdiGrabber gdi) gdi.Dispose();
         try { Session.DataLink.SendData(Rec.Json(Rec.End, Id, new JsonObject { ["ok"] = true }), CancellationToken.None); } catch { }
     }
 
@@ -379,21 +403,44 @@ public sealed class ScreenClient : IStreamSink
 
     public void Close() => _s.Cancel(Id);
 
+    /// <summary>True: the viewer calls <see cref="Ack"/> itself once a frame is drawn (instead of right after decoding).</summary>
+    public bool AckAfterDraw { get; init; }
+
+    public void Ack(uint seq)
+    {
+        try { _s.SendEvent(new JsonObject { ["ev"] = "screen-ack", ["id"] = Id, ["seq"] = seq }); } catch { }
+    }
+
+    private readonly object _frameGate = new();
+
     public void OnData(ReadOnlySpan<byte> data)
     {
         if (data.Length == 0) return;
-        byte flags = data[0];
-        if ((flags & ScreenProto.First) != 0) { _buf.SetLength(0); _inFrame = true; }
-        if (!_inFrame) return;
-        _buf.Write(data[1..]);
-        if ((flags & ScreenProto.Last) == 0) return;
-        _inFrame = false;
-        var (seq, w, h, tiles) = ScreenProto.Parse(_buf.ToArray());
+        byte[] whole;
+        // Data can come over Bluetooth and Wi-Fi at once (the sender switched links): one frame at a time.
+        lock (_frameGate)
+        {
+            byte flags = data[0];
+            if ((flags & ScreenProto.First) != 0) { _buf.SetLength(0); _inFrame = true; }
+            if (!_inFrame) return;
+            _buf.Write(data[1..]);
+            if ((flags & ScreenProto.Last) == 0) return;
+            _inFrame = false;
+            whole = _buf.ToArray();
+        }
+        uint seq; int w, h; List<ScreenTile> tiles;
+        try { (seq, w, h, tiles) = ScreenProto.Parse(whole); }
+        catch (Exception ex)
+        {
+            // A frame cut by a link change: skip it (the sender starts again with a whole picture).
+            Log.Write("frame dropped: " + ex.Message);
+            return;
+        }
         FrameW = w;
         FrameH = h;
         try { Frame?.Invoke(seq, w, h, tiles); }
         catch (Exception ex) { Log.Write("frame: " + ex.Message); }
-        try { _s.SendEvent(new JsonObject { ["ev"] = "screen-ack", ["id"] = Id, ["seq"] = seq }); } catch { }
+        if (!AckAfterDraw) Ack(seq);
     }
 
     public void OnEnd(JsonObject end) => Closed?.Invoke("השיתוף הסתיים");

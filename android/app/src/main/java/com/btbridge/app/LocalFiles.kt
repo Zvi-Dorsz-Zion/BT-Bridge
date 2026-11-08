@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
@@ -25,6 +26,8 @@ object LocalFiles {
                 if (!c.isNull(1)) size = c.getLong(1)
             }
         }
+        // Some apps don't tell the size: without it progress stays at 0 and an interrupted upload can't resume.
+        if (size <= 0) size = sizeOf(ctx, uri)
         val mtime = runCatching {
             ctx.contentResolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_LAST_MODIFIED), null, null, null)?.use { c ->
                 if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
@@ -58,7 +61,7 @@ object LocalFiles {
                         walk(id, if (rel.isEmpty()) name else "$rel/$name")
                     } else {
                         val uri = DocumentsContract.buildDocumentUriUsingTree(tree, id)
-                        val size = if (c.isNull(3)) 0 else c.getLong(3)
+                        val size = if (c.isNull(3) || c.getLong(3) <= 0) sizeOf(ctx, uri) else c.getLong(3)
                         val mtime = if (c.isNull(4)) System.currentTimeMillis() else c.getLong(4)
                         out += PickedFile(name, size, mtime, rel) { ctx.contentResolver.openInputStream(uri) ?: error("לא ניתן לפתוח את $name") }
                     }
@@ -69,6 +72,32 @@ object LocalFiles {
         return rootName to out
     }
 
+    /** The size from the file itself, when the provider didn't report it (0 when it really can't be found). */
+    fun sizeOf(ctx: Context, uri: Uri): Long {
+        runCatching {
+            val afd = ctx.contentResolver.openAssetFileDescriptor(uri, "r")
+            try {
+                val n = afd?.length ?: -1
+                if (n > 0) return n
+            } finally {
+                runCatching { afd?.close() }
+            }
+        }
+        runCatching {
+            val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+            try {
+                val n = pfd?.statSize ?: -1
+                if (n > 0) return n
+            } finally {
+                runCatching { pfd?.close() }
+            }
+        }
+        return 0
+    }
+
+    /** Before Android 8.0 "unknown apps" is one switch for the whole phone, and the installer asks by itself. */
+    fun canInstallApps(ctx: Context): Boolean = Build.VERSION.SDK_INT < 26 || ctx.packageManager.canRequestPackageInstalls()
+
     fun open(ctx: Context, f: File) {
         if (!f.exists()) {
             Toast.makeText(ctx, "הקובץ כבר נמחק. אפשר לפתוח אותו שוב מהסייר.", Toast.LENGTH_LONG).show()
@@ -76,7 +105,7 @@ object LocalFiles {
         }
         val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
         val ext = f.extension.lowercase()
-        if (ext == "apk" && !ctx.packageManager.canRequestPackageInstalls()) {
+        if (ext == "apk" && !canInstallApps(ctx)) {
             // Android hands an APK to the installer only after "install unknown apps" was allowed for us.
             Toast.makeText(ctx, "כדי להתקין, אשר \"התקנת אפליקציות לא מוכרות\" לגשר בלוטוס, חזור והקש שוב על הקובץ", Toast.LENGTH_LONG).show()
             ctx.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
